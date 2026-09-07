@@ -1,0 +1,40 @@
+# Runtime dependencies — EXACT pins.
+#
+# Every version below is the version this project was actually developed and
+# tested against (1296 tests passing). They are pinned exactly, not floored,
+# because Render resolves this file at build time: an unpinned `streamlit`
+# would silently install whatever is current on the day of a deploy, and this
+# codebase depends on version-specific Streamlit behaviour — st.code(wrap_lines=…),
+# the ":green-badge[…]" markdown used by app/utils/ui.py, st.navigation, and the
+# streamlit.testing.v1 AppTest API the page tests are written against.
+#
+# Test-only dependencies live in requirements-dev.txt so they are not installed
+# into the production image.
+#
+# Python: see .python-version.
+
+streamlit==1.62.0
+sqlalchemy==2.0.52
+psycopg2-binary==2.9.12
+alembic==1.19.1
+python-dotenv==1.2.3
+passlib==1.7.4
+# passlib 1.7.4's bcrypt backend is broken by bcrypt >= 4.1 (its internal
+# self-test passes a >72-byte secret, which newer bcrypt rejects instead of
+# truncating). Pin to the last compatible release until passlib ships a fix.
+bcrypt==4.0.1
+PyMuPDF==1.28.2
+python-docx==1.2.0
+anthropic==1.2.0
+pydantic==2.13.5
+# Google Drive document storage — imported ONLY by app/services/storage_service.py
+# (CLAUDE.md §17: the provider stays swappable). Auth is OAuth 2.0 as the human
+# Drive-folder owner: google-auth provides google.oauth2.credentials +
+# automatic access-token refresh; google-api-python-client builds the Drive
+# service. google-auth-oauthlib (InstalledAppFlow) is used ONLY by the one-time
+# scripts/authorize_drive_oauth.py to obtain the refresh token — not at runtime.
+# It is kept here rather than in requirements-dev.txt because that script is an
+# operational tool a deployer may need to re-run against production.
+google-api-python-client==2.200.0
+google-auth==2.57.0
+google-auth-oauthlib==1.4.1

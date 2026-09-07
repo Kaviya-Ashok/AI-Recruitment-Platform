@@ -1,0 +1,10 @@
+{
+  "assessments": [
+    {
+      "criterion_index": 1,
+      "result": "MAYBE",
+      "evidence_summary": "Some Python experience is shown.",
+      "reasoning": "Unclear."
+    }
+  ]
+}

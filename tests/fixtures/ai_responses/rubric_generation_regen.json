@@ -1,0 +1,7 @@
+{
+  "criteria": [
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "criterion_text": "Go (Golang) for production backend services", "source_requirement_index": 1},
+    {"requirement_type": "MANDATORY", "category": "Systems", "criterion_text": "Designs and operates distributed systems", "source_requirement_index": 2},
+    {"requirement_type": "PREFERRED", "category": null, "criterion_text": "Kafka or another event-streaming platform", "source_requirement_index": 3}
+  ]
+}

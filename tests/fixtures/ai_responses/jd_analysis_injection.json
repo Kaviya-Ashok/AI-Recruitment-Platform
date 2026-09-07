@@ -1,0 +1,7 @@
+{
+  "requirements": [
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "requirement_text": "Java and the Spring Boot framework"},
+    {"requirement_type": "PREFERRED", "category": "Technical Skill", "requirement_text": "Experience with Kafka"},
+    {"requirement_type": "EXPERIENCE", "category": null, "requirement_text": "Several years building customer-facing APIs"}
+  ]
+}

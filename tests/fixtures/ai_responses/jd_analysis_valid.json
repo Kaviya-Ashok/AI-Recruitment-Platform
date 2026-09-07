@@ -1,0 +1,10 @@
+{
+  "requirements": [
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "requirement_text": "5+ years of professional Python development"},
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "requirement_text": "Production experience operating PostgreSQL"},
+    {"requirement_type": "PREFERRED", "category": "Technical Skill", "requirement_text": "Experience with Apache Spark or similar distributed processing"},
+    {"requirement_type": "EXPERIENCE", "category": null, "requirement_text": "Has designed and owned data pipelines end to end"},
+    {"requirement_type": "BEHAVIORAL", "category": "Collaboration", "requirement_text": "Mentors and reviews the work of junior engineers"},
+    {"requirement_type": "OTHER", "category": "Logistics", "requirement_text": "Available to overlap with US Eastern working hours"}
+  ]
+}

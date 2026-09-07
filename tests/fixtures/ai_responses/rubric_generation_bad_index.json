@@ -1,0 +1,7 @@
+{
+  "criteria": [
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "criterion_text": "5+ years of professional Python development", "source_requirement_index": 1},
+    {"requirement_type": "PREFERRED", "category": null, "criterion_text": "A criterion whose source index points nowhere", "source_requirement_index": 99},
+    {"requirement_type": "BEHAVIORAL", "category": "Collaboration", "criterion_text": "Synthesised behavioural criterion with no single source", "source_requirement_index": null}
+  ]
+}

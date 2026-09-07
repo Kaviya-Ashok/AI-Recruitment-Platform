@@ -1,0 +1,18 @@
+{
+  "skills": ["Java", "Spring Boot", "REST API design"],
+  "technologies": ["Java", "Spring Boot", "Kafka", "MySQL"],
+  "experience": [
+    {
+      "role": "Backend Engineer",
+      "organization": "PaymentsCo",
+      "dates": "2019 - 2024",
+      "description": "Built and operated customer-facing payment APIs."
+    }
+  ],
+  "projects": [],
+  "certifications": [],
+  "education": [
+    {"qualification": "B.Tech Information Technology", "institution": "Tech Institute", "dates": "2015 - 2019"}
+  ],
+  "other_relevant_claims": []
+}

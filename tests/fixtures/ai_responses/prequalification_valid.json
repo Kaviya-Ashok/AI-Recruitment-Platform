@@ -1,0 +1,34 @@
+{
+  "assessments": [
+    {
+      "criterion_index": 1,
+      "result": "PASS",
+      "evidence_summary": "Two roles are Python-primary: Backend Engineer at PayStream (Mar 2021 to Present, about 3.5 years) and Software Developer at Contoso (2019 to 2021) which included Python scripting alongside Java. Combined professional Python exposure exceeds five years.",
+      "reasoning": "The stated durations and role descriptions together clear the 5-year threshold, with the PayStream role providing the bulk of the dedicated Python work."
+    },
+    {
+      "criterion_index": 2,
+      "result": "UNKNOWN",
+      "evidence_summary": "Neither the skills, technologies, experience descriptions, nor projects mention Apache Spark or PySpark in any form anywhere in the resume evidence.",
+      "reasoning": "The resume does not address distributed processing with Spark either way; absence of a mention is not evidence the candidate lacks the skill."
+    },
+    {
+      "criterion_index": 3,
+      "result": "PASS",
+      "evidence_summary": "RabbitMQ appears in the technologies list and in the Realtime ledger project.",
+      "reasoning": "RabbitMQ is an accepted equivalent messaging platform."
+    },
+    {
+      "criterion_index": 4,
+      "result": "UNKNOWN",
+      "evidence_summary": "The resume lists technical roles and a project but says nothing about mentoring, coaching, leading, or line-managing other engineers.",
+      "reasoning": "No mention either way; clarify in screening rather than assume."
+    },
+    {
+      "criterion_index": 5,
+      "result": "FAIL",
+      "evidence_summary": "An other-relevant-claims entry states the candidate is seeking fully remote roles only, which directly conflicts with a requirement to be available on-site in Berlin for this position.",
+      "reasoning": "The stated remote-only preference is an explicit contradiction of the on-site criterion, so this is a fail rather than an unknown."
+    }
+  ]
+}

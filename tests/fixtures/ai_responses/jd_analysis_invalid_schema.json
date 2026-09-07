@@ -1,0 +1,6 @@
+{
+  "requirements": [
+    {"requirement_type": "REQUIRED", "category": "Technical Skill", "requirement_text": "Python"},
+    {"requirement_type": "MANDATORY", "category": "Technical Skill", "requirement_text": "   "}
+  ]
+}

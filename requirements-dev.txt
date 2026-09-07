@@ -1,0 +1,14 @@
+# Development / test dependencies — EXACT pins.
+#
+# Install alongside the runtime set:
+#
+#     pip install -r requirements.txt -r requirements-dev.txt
+#
+# Kept out of requirements.txt so Render's build does not install a test
+# framework into the production image. Nothing in app/ imports pytest, so the
+# two Streamlit services run with requirements.txt alone.
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-mock==3.15.1

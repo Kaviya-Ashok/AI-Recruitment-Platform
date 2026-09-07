@@ -1,0 +1,70 @@
+# Streamlit configuration (read from the working directory both apps are
+# launched from — the repo root — so it applies to app/main.py AND
+# app/public_main.py).
+
+[server]
+# Render (and any container host) runs Streamlit with no browser and no TTY.
+# Without headless, Streamlit's first run tries to show its welcome/email
+# prompt, which can stall a container start. It also stops Streamlit trying to
+# open a local browser.
+headless = true
+
+# Keep in sync with app/utils/validation.py :: MAX_UPLOAD_BYTES.
+# Streamlit interprets this value in MiB (it multiplies by 1024*1024
+# internally), so 10 == 10 MiB == MAX_UPLOAD_BYTES. Without this line the
+# st.file_uploader widget advertises Streamlit's 200 MB default, which
+# contradicts the 10 MiB limit that validate_uploaded_file actually enforces
+# server-side.
+maxUploadSize = 10
+
+[browser]
+# No usage telemetry from a platform that processes candidate CVs, names and
+# interview notes. Off by explicit choice, not by accident.
+gatherUsageStats = false
+
+# ---------------------------------------------------------------------------
+# Theme — native Streamlit configuration only (no CSS/HTML anywhere).
+# Applies to BOTH entrypoints (this file is resolved from the repo root that
+# `streamlit run app/main.py` and `streamlit run app/public_main.py` share).
+#
+# Goal: a calm, professional recruitment-SaaS feel instead of the stock
+# white/coral prototype look, WITHOUT disturbing the inline coloured badges
+# (app/utils/ui.py). Those badges render through Streamlit's own theme tokens
+# (greenColor / redColor / …), which are deliberately NOT overridden here, so
+# they keep their default pale-fill/saturated-text appearance and stay legible.
+#
+# Contrast (sRGB, light base):
+#   textColor #2B2B31 on backgroundColor #FDFDFB ......... ~14:1  (AAA)
+#   white text on primaryColor #2E6E4E .................. ~6.2:1 (AA, UI+text)
+#   textColor #2B2B31 on secondaryBackgroundColor #EEF1EC  ~12:1  (AAA)
+#   backgroundColor is within ~1.5% luminance of pure white, so the badge
+#   chip fills keep the same separation from the page they have on #FFFFFF.
+# ---------------------------------------------------------------------------
+[theme]
+# Pin the light base so the palette above is what every visitor sees,
+# regardless of their OS/browser dark-mode preference.
+base = "light"
+
+# Accent for buttons, toggles, links, focus rings, active nav item. A deep,
+# desaturated green ("grow the team") — replaces the stock alarm-red #FF4B4B,
+# which reads badly in a hiring tool. Dark + muted, so it harmonises with the
+# green PASS badge rather than competing with it, and does not vibrate against
+# the pale-pink FAIL badge.
+primaryColor = "#2E6E4E"
+
+# Barely-warm off-white. Enough to read as "designed", light enough that the
+# pale badge fills (green/gray especially) stay distinguishable against it.
+backgroundColor = "#FDFDFB"
+
+# Quiet sage — sidebar background and form-field fills (text inputs, selects,
+# text areas). No badge is ever rendered on this surface, so its slightly
+# lower luminance is safe; it ties the chrome to primaryColor.
+secondaryBackgroundColor = "#EEF1EC"
+
+# Near-black with a faint cool cast — crisp on the warm background, a touch
+# deeper than Streamlit's default #31333F.
+textColor = "#2B2B31"
+
+# Keep Streamlit's default sans (Source Sans Pro) — clean and professional,
+# no font hosting, no new dependency. Set explicitly to document the intent.
+font = "sans serif"

@@ -1,0 +1,35 @@
+{
+  "skills": ["Python", "Data pipeline design", "SQL", "Team mentoring"],
+  "technologies": ["Python", "PostgreSQL", "Apache Spark", "Airflow", "AWS", "Docker"],
+  "experience": [
+    {
+      "role": "Senior Data Engineer",
+      "organization": "Acme Analytics",
+      "dates": "Jan 2021 - Present",
+      "description": "Owns the ingestion platform; built batch and streaming pipelines processing ~2TB/day; mentors two junior engineers."
+    },
+    {
+      "role": "Data Engineer",
+      "organization": "DataCorp",
+      "dates": "2018 - 2020",
+      "description": "Migrated ETL jobs from cron scripts to Airflow; introduced data quality checks."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Realtime fraud scoring pipeline",
+      "description": "Kafka -> Spark Structured Streaming -> feature store, sub-second latency.",
+      "technologies": ["Apache Spark", "Kafka", "Redis"]
+    }
+  ],
+  "certifications": [
+    {"name": "AWS Certified Data Analytics - Specialty", "issuer": "Amazon Web Services", "date": "2022"}
+  ],
+  "education": [
+    {"qualification": "B.Sc. Computer Science", "institution": "State University", "dates": "2014 - 2018"}
+  ],
+  "other_relevant_claims": [
+    "Maintainer of an open-source Airflow provider package",
+    "Speaker at PyData 2023"
+  ]
+}

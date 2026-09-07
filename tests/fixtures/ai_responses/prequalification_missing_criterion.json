@@ -1,0 +1,28 @@
+{
+  "assessments": [
+    {
+      "criterion_index": 1,
+      "result": "PASS",
+      "evidence_summary": "Two Python-primary roles totalling more than five years of professional experience.",
+      "reasoning": "Durations stated on the resume clear the threshold."
+    },
+    {
+      "criterion_index": 2,
+      "result": "UNKNOWN",
+      "evidence_summary": "No mention of Spark or PySpark anywhere in the evidence.",
+      "reasoning": "Not addressed either way."
+    },
+    {
+      "criterion_index": 4,
+      "result": "UNKNOWN",
+      "evidence_summary": "No mention of mentoring or coaching.",
+      "reasoning": "Not addressed either way."
+    },
+    {
+      "criterion_index": 5,
+      "result": "FAIL",
+      "evidence_summary": "Resume states the candidate is seeking fully remote roles only.",
+      "reasoning": "Directly contradicts the on-site requirement."
+    }
+  ]
+}
