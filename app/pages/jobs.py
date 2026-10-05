@@ -664,6 +664,7 @@ def _render_job_card(
         return
 
     with card:
+        st.caption(f"Job code: {job_view['job_code']}")
         label = "Re-analyze JD" if analyzed else "Analyze JD"
         clicked = st.button(
             label,
@@ -687,6 +688,7 @@ def _render_job_card(
 def _job_view(job) -> dict:
     return {
         "id": job.id,
+        "job_code": job.job_code,
         "title": job.title,
         "department": job.department,
         "status": job.status,

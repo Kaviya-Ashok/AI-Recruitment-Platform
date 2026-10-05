@@ -31,7 +31,10 @@ Env vars (all required at the first Drive call):
   ``scripts/authorize_drive_oauth.py``. Credential-equivalent: env only, never
   logged, never echoed in an error.
 * ``GOOGLE_DRIVE_ROOT_FOLDER_ID`` — the root folder (owned by the same account).
-  One subfolder per job is created lazily beneath it, named by ``job_id``.
+  One subfolder per job is created lazily beneath it, named
+  ``"<job_code> - <title>"``. Jobs uploaded to before job codes existed keep
+  their UUID-named folder: it is found by the ``drive_folder_id`` stored on their
+  documents, never by name, and is never renamed.
 
 Missing config raises :class:`StorageConfigError`; a revoked/invalid refresh
 token raises :class:`DriveAuthError` — never a silent no-op, never a raw SDK
@@ -62,6 +65,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -72,6 +76,7 @@ from sqlalchemy.orm import Session
 from app.database.models.application import Application
 from app.database.models.audit_event import AuditEventType
 from app.database.models.document import Document
+from app.database.models.job import Job
 from app.services.audit_service import record_event
 from app.utils.authorization import require_internal_user
 from app.utils.validation import sanitize_filename, validate_uploaded_file
@@ -261,9 +266,13 @@ def _drive_find_folder(
     service: object, root_folder_id: str, name: str
 ) -> str | None:
     """Return the id of a non-trashed subfolder named ``name`` under the root,
-    or ``None``. First match wins (folder names under the root are unique by
-    construction — we only ever create one per job_id)."""
-    safe_name = name.replace("'", r"\'")
+    or ``None``. First match wins (names are ``"<job_code> - <title>"``, and
+    ``job_code`` is globally unique, so a name identifies at most one job).
+
+    Drive's query language uses backslash as its escape character, so
+    backslashes are escaped FIRST and quotes second — the other order would
+    double-escape the backslash that the quote escape just introduced."""
+    safe_name = name.replace("\\", "\\\\").replace("'", "\\'")
     query = (
         f"name = '{safe_name}' and '{root_folder_id}' in parents and "
         f"mimeType = '{_DRIVE_FOLDER_MIME}' and trashed = false"
@@ -310,6 +319,43 @@ def _drive_create_folder(
             f"Could not create the job subfolder in Drive: {type(exc).__name__}."
         ) from exc
     return folder["id"]
+
+
+def _drive_folder_usable(service: object, folder_id: str) -> bool:
+    """True if ``folder_id`` is an existing, non-trashed Drive folder.
+
+    Gives a DEFINITIVE answer or raises. ``404`` (deleted, or not visible to this
+    account) and ``trashed`` mean "gone" -> ``False``. Any other failure (network,
+    5xx, 403 quota) raises :class:`DriveUploadError` rather than returning
+    ``False``: treating a transient blip as "folder missing" would send the
+    caller on to create a second folder for a job that already has one.
+    """
+    from googleapiclient.errors import HttpError  # noqa: PLC0415 - SDK isolated
+
+    try:
+        meta = (
+            service.files()
+            .get(
+                fileId=folder_id,
+                fields="id, trashed, mimeType",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+    except HttpError as exc:
+        if getattr(getattr(exc, "resp", None), "status", None) == 404:
+            return False
+        raise DriveUploadError(
+            f"Could not verify the job subfolder in Drive: {type(exc).__name__}."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - normalise to our domain error
+        raise DriveUploadError(
+            f"Could not verify the job subfolder in Drive: {type(exc).__name__}."
+        ) from exc
+    return (
+        not meta.get("trashed", False)
+        and meta.get("mimeType") == _DRIVE_FOLDER_MIME
+    )
 
 
 def _drive_upload_file(
@@ -366,20 +412,74 @@ def _drive_download_file(service: object, drive_file_id: str) -> bytes:
 # --- internal helpers ------------------------------------------------
 
 
+#: Cap on the TITLE part of a folder name. Drive allows far longer, but a
+#: 255-char job title makes an unreadable folder in the Drive UI.
+_FOLDER_TITLE_MAX = 80
+
+
+def _job_folder_name(job_code: str, title: str | None) -> str:
+    """``"<job_code> - <sanitized title>"``, or just ``job_code`` if nothing of
+    the title survives sanitising. Pure; never mutates the stored job title.
+
+    Sanitising, in order: collapse all whitespace (so a tab or newline between
+    words becomes one space rather than gluing them together) -> remove ``/`` and
+    ``\\`` -> remove remaining control characters -> collapse whitespace again
+    (the removals can leave doubles) -> cap at :data:`_FOLDER_TITLE_MAX` ->
+    trim. Only Unicode category ``Cc`` is removed: format characters such as the
+    zero-width joiner are legitimate inside Indic scripts and emoji.
+    """
+    text_ = " ".join((title or "").split())
+    text_ = "".join(
+        ch
+        for ch in text_
+        if ch not in "/\\" and unicodedata.category(ch) != "Cc"
+    )
+    text_ = " ".join(text_.split())[:_FOLDER_TITLE_MAX].rstrip()
+    return f"{job_code} - {text_}" if text_ else job_code
+
+
 def _resolve_job_folder(
-    service: object, root_folder_id: str, job_id: uuid.UUID | str
+    db: Session, service: object, root_folder_id: str, job: Job
 ) -> str:
     """Return the Drive folder id for a job, creating it on first use.
 
-    The folder is named by ``job_id`` (a UUID — collision-free and Drive-safe,
-    unlike a job title). Checked-then-created; not pre-created at job creation.
+    Lookup order — so legacy UUID-named folders keep working and a job never
+    ends up with two folders:
+
+    a. **Stored id.** If any existing document for this job recorded a
+       ``drive_folder_id``, use the first one that still exists and is not
+       trashed. This is what keeps a pre-existing UUID-named folder in use: it
+       is found by id, so its (old-style) name no longer matters. Existing
+       folders are never renamed.
+    b. **New-style name** under the root.
+    c. **Create** a folder with the new-style name.
+
+    Not pre-created at job creation; checked-then-created on first upload.
     """
-    name = str(job_id)
+    stored = db.execute(
+        select(Document.drive_folder_id)
+        .join(Application, Application.id == Document.application_id)
+        .where(Application.job_id == job.id)
+        .order_by(Document.uploaded_at, Document.id)
+    ).scalars().all()
+    seen: set[str] = set()
+    for folder_id in stored:
+        if folder_id in seen:
+            continue
+        seen.add(folder_id)
+        if _drive_folder_usable(service, folder_id):
+            return folder_id
+
+    name = _job_folder_name(job.job_code, job.title)
     existing = _drive_find_folder(service, root_folder_id, name)
     if existing is not None:
         return existing
     folder_id = _drive_create_folder(service, root_folder_id, name)
-    logger.info("storage: created Drive subfolder for job=%s", job_id)
+    # Ids only — the folder name embeds the job title.
+    logger.info(
+        "storage: created Drive subfolder for job=%s code=%s",
+        job.id, job.job_code,
+    )
     return folder_id
 
 
@@ -443,7 +543,8 @@ def upload_document(
     # 2. Drive side effects. Any failure here raises DriveUploadError and we
     #    never reach the DB write below.
     service, root_folder_id = _get_drive()
-    folder_id = _resolve_job_folder(service, root_folder_id, job_id)
+    job = db.get(Job, application.job_id)
+    folder_id = _resolve_job_folder(db, service, root_folder_id, job)
     drive_file_id, size_bytes = _drive_upload_file(
         service, folder_id, safe_name, file_bytes, mime_type
     )

@@ -745,3 +745,193 @@ def test_resume_retry_token_column_is_dropped_on_downgrade(
             assert "resume_retry_token" in cols
     finally:
         engine.dispose()
+
+
+# --- jobs.job_code (migration f7a8b9c0d1e2) ---------------------------------
+
+_PRE_JOB_CODE = "e6f7a8b9c0d1"     # the revision this migration sits on
+_JOB_CODE_REV = "f7a8b9c0d1e2"
+
+_INSERT_JOB = sa.text(
+    "INSERT INTO jobs (id, title, jd_source_text, jd_input_method, created_at) "
+    "VALUES (:id, :title, 'x', 'TEXT_PASTE', :created_at)"
+)
+
+
+def _fresh_at(migrate, revision):
+    """Reset the module-scoped scratch database to ``revision``."""
+    migrate("downgrade", "base")
+    migrate("upgrade", revision)
+
+
+def test_job_code_backfill_is_deterministic_and_advances_the_sequence(
+    migrate, temp_database_url
+):
+    """Existing jobs are numbered in (created_at, id) order. Two jobs share a
+    timestamp, so the id tiebreak is what makes the result deterministic."""
+    _fresh_at(migrate, _PRE_JOB_CODE)
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.begin() as conn:
+            # Inserted in an order that differs from the expected numbering.
+            for jid, title, ts in (
+                ("00000000-0000-0000-0000-0000000000dd", "late", "2026-03-01 00:00:00+00"),
+                ("00000000-0000-0000-0000-0000000000bb", "tie-b", "2026-02-01 00:00:00+00"),
+                ("00000000-0000-0000-0000-0000000000ee", "early", "2026-01-01 00:00:00+00"),
+                ("00000000-0000-0000-0000-0000000000aa", "tie-a", "2026-02-01 00:00:00+00"),
+            ):
+                conn.execute(
+                    _INSERT_JOB, {"id": jid, "title": title, "created_at": ts}
+                )
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _JOB_CODE_REV)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            got = dict(conn.execute(
+                sa.text("SELECT title, job_code FROM jobs")
+            ).all())
+            assert got == {
+                "early": "V_001",
+                "tie-a": "V_002",    # same timestamp as tie-b; lower id first
+                "tie-b": "V_003",
+                "late": "V_004",
+            }
+            # The sequence continues from the backfill: next new job is N+1.
+            assert conn.execute(sa.text("SELECT next_job_code()")).scalar_one() == "V_005"
+    finally:
+        engine.dispose()
+
+
+def test_job_code_backfill_pads_correctly_past_999(migrate, temp_database_url):
+    """``lpad`` truncates anything longer than its width; the migration widens
+    the pad instead, in BOTH the backfill and the column default."""
+    _fresh_at(migrate, _PRE_JOB_CODE)
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO jobs (id, title, jd_source_text, jd_input_method, created_at) "
+                "SELECT md5(random()::text || g::text)::uuid, 'T' || g, 'x', "
+                "'TEXT_PASTE', timestamptz '2026-01-01 00:00:00+00' "
+                "+ (g || ' seconds')::interval "
+                "FROM generate_series(1, 1001) AS g"
+            ))
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _JOB_CODE_REV)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            by_title = dict(conn.execute(
+                sa.text("SELECT title, job_code FROM jobs")
+            ).all())
+            assert len(by_title) == 1001
+            assert len(set(by_title.values())) == 1001            # all unique
+            assert by_title["T1"] == "V_001"
+            assert by_title["T999"] == "V_999"
+            assert by_title["T1000"] == "V_1000"                  # widened
+            assert by_title["T1001"] == "V_1001"
+            assert conn.execute(sa.text("SELECT next_job_code()")).scalar_one() == "V_1002"
+    finally:
+        engine.dispose()
+
+
+def test_job_code_migration_on_an_empty_jobs_table(migrate, temp_database_url):
+    """setval(seq, 0) is out of range, so the empty case must skip it: the first
+    job created afterwards is V_001, not an error."""
+    _fresh_at(migrate, _PRE_JOB_CODE)
+    migrate("upgrade", _JOB_CODE_REV)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(sa.text("SELECT next_job_code()")).scalar_one() == "V_001"
+            assert conn.execute(sa.text("SELECT next_job_code()")).scalar_one() == "V_002"
+    finally:
+        engine.dispose()
+
+
+def test_job_code_column_constraints_and_default(migrate, temp_database_url):
+    migrate("downgrade", "base")
+    migrate("upgrade", "head")
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            cols = {c["name"]: c for c in inspector.get_columns("jobs")}
+            assert cols["job_code"]["nullable"] is False
+            assert "next_job_code()" in (cols["job_code"]["default"] or "")
+
+            uniques = {
+                u["name"]: u["column_names"]
+                for u in inspector.get_unique_constraints("jobs")
+            }
+            assert uniques["uq_jobs_job_code"] == ["job_code"]
+
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_proc WHERE proname = 'next_job_code'"
+            )).scalar_one() == 1
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_class "
+                "WHERE relkind = 'S' AND relname = 'job_code_seq'"
+            )).scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+def test_job_code_downgrade_leaves_nothing_behind_and_reupgrades(
+    migrate, temp_database_url
+):
+    """upgrade -> downgrade -> upgrade. The downgrade must drop the column, the
+    constraint, the function AND the sequence, or the re-upgrade dies with
+    "already exists"."""
+    _fresh_at(migrate, _PRE_JOB_CODE)
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.begin() as conn:
+            conn.execute(_INSERT_JOB, {
+                "id": "00000000-0000-0000-0000-0000000000a1",
+                "title": "only", "created_at": "2026-01-01 00:00:00+00",
+            })
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _JOB_CODE_REV)
+    migrate("downgrade", _PRE_JOB_CODE)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            assert "job_code" not in {c["name"] for c in inspector.get_columns("jobs")}
+            assert "uq_jobs_job_code" not in {
+                u["name"] for u in inspector.get_unique_constraints("jobs")
+            }
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_proc WHERE proname = 'next_job_code'"
+            )).scalar_one() == 0
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_class "
+                "WHERE relkind = 'S' AND relname = 'job_code_seq'"
+            )).scalar_one() == 0
+            # the job row itself survives the downgrade
+            assert conn.execute(sa.text("SELECT count(*) FROM jobs")).scalar_one() == 1
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _JOB_CODE_REV)          # must not raise
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(
+                sa.text("SELECT job_code FROM jobs")
+            ).scalar_one() == "V_001"
+    finally:
+        engine.dispose()

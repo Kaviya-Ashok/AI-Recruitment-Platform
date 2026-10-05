@@ -72,6 +72,24 @@ def _no_real_screening_evaluation_call(mocker):
     )
 
 
+@pytest.fixture(autouse=True)
+def _drive_folder_usable_defaults_to_true(mocker):
+    """Job-folder resolution first verifies a stored ``drive_folder_id`` via the
+    ``_drive_folder_usable`` seam (job codes / Drive folder naming). No test may
+    reach the real Drive SDK, and several suites carry their own four-seam
+    ``FakeDrive`` that predates this seam. By default a stored folder id is
+    treated as usable — i.e. "reuse the folder this job already has", which is
+    exactly the behaviour those suites expect on a second upload. Tests of the
+    verification itself ``mocker.patch.object`` the same seam (that patch wins
+    over this one), exactly as with the fixture above.
+    """
+    from app.services import storage_service
+
+    mocker.patch.object(
+        storage_service, "_drive_folder_usable", return_value=True
+    )
+
+
 # --- Real document fixtures (built with the actual libraries, never mocked) ---
 
 

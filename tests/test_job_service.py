@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
+import threading
 import uuid
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import func, select, update
 
 from app.database.models.audit_event import AuditEvent, AuditEventType
@@ -263,3 +266,126 @@ def test_create_job_does_not_populate_job_requirements(db):
         .select_from(JobRequirement)
         .where(JobRequirement.job_id == job.id)
     ).scalar_one() == 0
+
+
+# --- job_code (migration f7a8b9c0d1e2) -----------------------------------
+#
+# Codes come from a Postgres sequence evaluated by a column DEFAULT. A sequence
+# is global and non-transactional, so these tests never assume an ABSOLUTE
+# number (other tests, and rolled-back runs, advance it) - only format,
+# uniqueness and "next = previous + 1".
+
+_CODE_RE = re.compile(r"^V_\d{3,}$")
+
+
+def _make_job(db, user, title="Platform Engineer"):
+    return create_job(
+        db,
+        title=title,
+        department=None,
+        jd_input_method=JdInputMethod.TEXT_PASTE,
+        jd_source_text="A JD.",
+        created_by_user_id=user.id,
+    )
+
+
+def _code_number(job) -> int:
+    return int(job.job_code.removeprefix("V_"))
+
+
+def test_create_job_assigns_a_correctly_formatted_code(db):
+    job = _make_job(db, _hr_user(db))
+    assert _CODE_RE.match(job.job_code), job.job_code
+
+
+def test_codes_are_sequential_and_unique_back_to_back(db):
+    user = _hr_user(db)
+    jobs = [_make_job(db, user, title=f"Role {i}") for i in range(5)]
+
+    numbers = [_code_number(j) for j in jobs]
+    assert numbers == list(range(numbers[0], numbers[0] + 5))   # +1 each time
+    assert len({j.job_code for j in jobs}) == 5
+
+
+def test_code_is_zero_padded_to_at_least_three_digits(db):
+    job = _make_job(db, _hr_user(db))
+    digits = job.job_code.removeprefix("V_")
+    assert len(digits) >= 3
+    assert digits == f"{int(digits):03d}"      # pads to 3, never truncates
+
+
+def test_a_directly_constructed_job_also_gets_a_code(db):
+    """The code is a column DEFAULT, not Python-side: a bare ``Job(...)`` (as
+    ``test_analyze_jd_empty_jd_raises`` builds) must not violate NOT NULL."""
+    user = _hr_user(db)
+    job = Job(
+        title="Direct",
+        department=None,
+        status=JobStatus.DRAFT,
+        jd_source_text="x",
+        jd_input_method=JdInputMethod.TEXT_PASTE,
+        created_by=user.id,
+    )
+    db.add(job)
+    db.flush()
+    assert _CODE_RE.match(job.job_code)
+
+
+def test_job_code_is_unique_at_the_database_level(db):
+    user = _hr_user(db)
+    first = _make_job(db, user)
+    clash = Job(
+        title="Clash", department=None, status=JobStatus.DRAFT,
+        jd_source_text="x", jd_input_method=JdInputMethod.TEXT_PASTE,
+        created_by=user.id, job_code=first.job_code,
+    )
+    db.add(clash)
+    with pytest.raises(sa.exc.IntegrityError):
+        with db.begin_nested():
+            db.flush()
+
+
+def test_the_code_is_never_changed_by_later_updates(db):
+    job = _make_job(db, _hr_user(db))
+    before = job.job_code
+    job.status = JobStatus.JD_ANALYZED
+    db.flush()
+    db.refresh(job)
+    assert job.job_code == before
+
+
+def test_create_job_audit_event_carries_the_job_code(db):
+    job = _make_job(db, _hr_user(db))
+    event = db.execute(
+        select(AuditEvent).where(
+            AuditEvent.entity_type == "job", AuditEvent.entity_id == job.id
+        )
+    ).scalar_one()
+    assert event.new_state["job_code"] == job.job_code
+
+
+def test_concurrent_code_generation_never_hands_out_a_duplicate():
+    """Real concurrency, on separate connections: ``next_job_code()`` is
+    sequence-backed, so simultaneous callers can never receive the same value.
+    Only a SELECT - no job rows are written to the shared dev database."""
+    import app.database.database as app_db
+
+    results: list[str] = []
+    lock = threading.Lock()
+
+    def worker():
+        with app_db.engine.connect() as conn:
+            for _ in range(10):
+                code = conn.execute(sa.text("SELECT next_job_code()")).scalar_one()
+                with lock:
+                    results.append(code)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 40
+    assert len(set(results)) == 40
+    assert all(_CODE_RE.match(c) for c in results)

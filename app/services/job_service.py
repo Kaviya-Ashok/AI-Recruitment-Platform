@@ -156,7 +156,9 @@ def create_job(
         created_by=created_by_user_id,
     )
     db.add(job)
-    db.flush()  # assign job.id
+    # Assigns job.id AND job.job_code: the code is a column DEFAULT backed by a
+    # Postgres sequence, evaluated by this INSERT in this transaction.
+    db.flush()
 
     method_desc = (
         f"pasted text ({len(jd_text)} chars)"
@@ -171,6 +173,7 @@ def create_job(
         entity_id=job.id,
         user_id=created_by_user_id,
         new_state={
+            "job_code": job.job_code,
             "title": job.title,
             "department": job.department,
             "status": job.status,

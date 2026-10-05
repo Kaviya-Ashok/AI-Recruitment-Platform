@@ -33,7 +33,16 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func, text
+from sqlalchemy import (
+    DateTime,
+    Enum,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -78,10 +87,25 @@ class Job(Base):
 
     __tablename__ = "jobs"
 
+    __table_args__ = (
+        UniqueConstraint("job_code", name="uq_jobs_job_code"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid.uuid4,
+    )
+
+    # Short human-readable identifier, "V_001" style (see migration
+    # f7a8b9c0d1e2). Assigned by the DATABASE, not Python: the column default
+    # calls ``next_job_code()`` (a sequence-backed SQL function), so every insert
+    # path — create_job or a bare ``Job(...)`` — gets a unique code atomically in
+    # the same statement. Never edited after creation.
+    job_code: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=text("next_job_code()"),
     )
 
     title: Mapped[str] = mapped_column(String(255), nullable=False)
