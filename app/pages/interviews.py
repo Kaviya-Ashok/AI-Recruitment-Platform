@@ -20,6 +20,13 @@ Scope (deliberately minimal)
   generation, feedback stays available for an unshortlisted candidate: an
   interview that happened must remain recordable.
 
+* Increment B: each recorded round can carry ONE interview transcript (PDF or
+  DOCX, stored in Google Drive). It can be attached from the feedback form
+  (saved as a separate step AFTER the feedback commits, so a failed upload never
+  loses the feedback) or later from the round's history, where it can also be
+  replaced. Replaced versions are kept. Transcripts are only stored and shown
+  here — no AI reads them.
+
 Rendered via ``st.navigation`` from ``app/main.py`` (never auto-discovered).
 100% HR-only — no candidate-facing surface is touched. Business logic lives in
 ``interview_guide_service``; this file is thin glue.
@@ -38,6 +45,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database.database import session_scope
 from app.database.models.interview_feedback import RATING_MAX, RATING_MIN
 from app.database.models.interview_guide import InterviewQuestionCategory
+from app.database.models.interview_transcript import InterviewTranscriptStatus
 from app.database.models.post_interview_analysis import (
     PostInterviewAnalysisStatus,
 )
@@ -59,6 +67,12 @@ from app.services.interview_guide_service import (
     generate_interview_guide,
     get_shortlisted_candidates_for_job,
     list_interview_guides_for_job,
+)
+from app.services.interview_transcript_service import (
+    InterviewTranscriptError,
+    attach_interview_transcript,
+    get_transcript_download_bytes,
+    list_transcripts_for_feedback,
 )
 from app.services.post_interview_service import (
     PostInterviewAnalysisError,
@@ -93,6 +107,21 @@ _GUIDE_UNEXPECTED = "Something went wrong generating the interview guide. Please
 _FEEDBACK_DB_ERROR = "Couldn't save the interview feedback — please try again."
 _FEEDBACK_UNEXPECTED = (
     "Something went wrong saving the interview feedback. Please try again."
+)
+_TRANSCRIPT_DB_ERROR = (
+    "Couldn't save the transcript — please try again."
+)
+_TRANSCRIPT_UNEXPECTED = (
+    "Something went wrong attaching the transcript. Please try again."
+)
+_TRANSCRIPT_UPLOAD_LABEL = "Interview transcript (PDF or DOCX, up to 10 MB)"
+_TRANSCRIPT_NOT_EXTRACTABLE = (
+    "This file has no readable text (it is probably a scan). It can be "
+    "stored, but an AI analysis will not be able to use it."
+)
+_ANALYSIS_STALE = (
+    "Feedback or a transcript was added or replaced after this analysis was "
+    "generated. Regenerate to include it."
 )
 _ANALYSIS_DB_ERROR = (
     "Couldn't save the post-interview analysis — please try again."
@@ -135,17 +164,24 @@ def _load_view(job_id: str, acting_user_id) -> dict:
         application_ids = {r.application_id for r in shortlisted} | {
             g.application_id for g in guides
         }
-        feedback = {
-            app_id: {
+        feedback = {}
+        for app_id in application_ids:
+            history = list_feedback_views(
+                db, app_id, acting_user_id=acting_user_id
+            )
+            feedback[app_id] = {
                 "context": get_feedback_context(
                     db, app_id, acting_user_id=acting_user_id
                 ),
-                "history": list_feedback_views(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
+                "history": history,
+                # {feedback_id: [every transcript version, newest first]}
+                "transcripts": {
+                    item.feedback_id: list_transcripts_for_feedback(
+                        db, item.feedback_id, acting_user_id=acting_user_id
+                    )
+                    for item in history
+                },
             }
-            for app_id in application_ids
-        }
         # Post-interview analyses for the same applications. Reading is a
         # plain SELECT — no AI call happens on page load (CLAUDE.md §§9, 29).
         analyses = {
@@ -204,13 +240,19 @@ def _run_submit_feedback(
     notes: str,
     ratings: list[dict],
     acting_user_id,
+    transcript: tuple[str, bytes] | None = None,
 ) -> None:
     """Submit one interview write-up. Same four-way exception ladder as the
     guide action — a validation problem shows its own readable message, and a
-    traceback never reaches the page."""
+    traceback never reaches the page.
+
+    ``transcript`` is an optional ``(file name, bytes)``. It is attached only
+    AFTER the feedback commit succeeded, as a SEPARATE transaction: a failed
+    upload never loses or blocks the feedback (which is immutable once saved).
+    """
     try:
         with session_scope() as db:
-            create_interview_feedback(
+            feedback = create_interview_feedback(
                 db,
                 user_id=acting_user_id,
                 application_id=uuid.UUID(application_id),
@@ -220,6 +262,7 @@ def _run_submit_feedback(
                 notes=notes,
                 ratings=ratings,
             )
+            feedback_id = feedback.id
     except UnauthorizedError:
         st.error("Your account is no longer active — please contact an admin.")
         return
@@ -233,8 +276,81 @@ def _run_submit_feedback(
         st.error(_FEEDBACK_UNEXPECTED)
         return
 
+    if transcript is not None:
+        problem = _attach_transcript(
+            feedback_id, transcript[1], transcript[0], acting_user_id
+        )
+        if problem is not None:
+            # st.rerun() would wipe an inline message, so park it for the
+            # section to show on the next run (temporary UI state only).
+            st.session_state[_transcript_notice_key(application_id)] = (
+                "The interview feedback was saved, but the transcript could "
+                f"not be attached: {problem} You can attach it from this "
+                "round's history below."
+            )
+
     success_toast("Interview feedback recorded.")
     st.rerun()
+
+
+def _transcript_notice_key(application_id) -> str:
+    return f"interviews_transcript_notice_{application_id}"
+
+
+def _attach_transcript(
+    feedback_id, file_bytes: bytes, file_name: str, acting_user_id
+) -> str | None:
+    """Attach (or replace) a round's transcript in its own transaction. Returns
+    ``None`` on success, otherwise a short user-safe reason. Never raises."""
+    try:
+        with session_scope() as db:
+            attach_interview_transcript(
+                db,
+                interview_feedback_id=feedback_id,
+                file_bytes=file_bytes,
+                original_filename=file_name,
+                acting_user_id=acting_user_id,
+            )
+    except UnauthorizedError:
+        return "Your account is no longer active — please contact an admin."
+    except InterviewTranscriptError as exc:
+        return str(exc)
+    except SQLAlchemyError:
+        return _TRANSCRIPT_DB_ERROR
+    except Exception:  # noqa: BLE001 - never surface a traceback
+        return _TRANSCRIPT_UNEXPECTED
+    return None
+
+
+def _run_attach_transcript(
+    feedback_id, file_bytes: bytes, file_name: str, acting_user_id
+) -> None:
+    """The history's attach/replace button."""
+    with st.spinner("Uploading the transcript…"):
+        problem = _attach_transcript(
+            feedback_id, file_bytes, file_name, acting_user_id
+        )
+    if problem is not None:
+        st.error(problem)
+        return
+    # A fresh uploader key on the next run empties the file picker.
+    version_key = f"interviews_transcript_uploader_{feedback_id}"
+    st.session_state[version_key] = st.session_state.get(version_key, 0) + 1
+    success_toast("Transcript attached.")
+    st.rerun()
+
+
+def _transcript_bytes_fn(transcript_id, acting_user_id):
+    """Deferred data for ``st.download_button``: Drive is only contacted when
+    the button is actually clicked, never on page load or rerun."""
+
+    def _fetch() -> bytes:
+        with session_scope() as db:
+            return get_transcript_download_bytes(
+                db, transcript_id, acting_user_id=acting_user_id
+            ).content
+
+    return _fetch
 
 
 def _run_generate_analysis(
@@ -360,9 +476,87 @@ def _render_guide(guide) -> None:
             st.markdown("")
 
 
-def _render_feedback_history(history: list) -> None:
+def _transcript_line(version) -> str:
+    kb = max(1, round(version.file_size_bytes / 1024))
+    return (
+        f"Version {version.version_number} · uploaded "
+        f"{version.created_at:%Y-%m-%d} by {version.uploaded_by_name} · {kb} KB"
+    )
+
+
+def _render_transcript_block(feedback_id, versions: list, acting_user_id) -> None:
+    """One round's transcript: the current file, any earlier versions, and an
+    attach/replace control. Stored and shown only — no AI reads transcripts."""
+    current = next(
+        (v for v in versions if v.status == InterviewTranscriptStatus.CURRENT),
+        None,
+    )
+    earlier = [v for v in versions if v is not current]
+
+    st.markdown("*Interview transcript*")
+    if current is None:
+        st.caption("No transcript attached.")
+    else:
+        st.markdown(f"`{current.file_name}`")
+        st.caption(_transcript_line(current))
+        if not current.text_extractable:
+            st.warning(_TRANSCRIPT_NOT_EXTRACTABLE)
+        st.download_button(
+            "Download transcript",
+            data=_transcript_bytes_fn(current.transcript_id, acting_user_id),
+            file_name=current.file_name,
+            mime=current.mime_type,
+            key=f"interviews_transcript_dl_{current.transcript_id}",
+        )
+
+    if earlier:
+        # A popover, not an expander: this block already sits inside the
+        # feedback expander and Streamlit does not allow expanders to nest.
+        with st.popover(f"Earlier versions ({len(earlier)})"):
+            st.caption(
+                "Kept, never deleted. Each was the current transcript until it "
+                "was replaced."
+            )
+            for old in earlier:
+                st.markdown(f"`{old.file_name}`")
+                st.caption(_transcript_line(old))
+                st.download_button(
+                    "Download",
+                    data=_transcript_bytes_fn(old.transcript_id, acting_user_id),
+                    file_name=old.file_name,
+                    mime=old.mime_type,
+                    key=f"interviews_transcript_dl_{old.transcript_id}",
+                )
+
+    version_key = f"interviews_transcript_uploader_{feedback_id}"
+    upload = st.file_uploader(
+        (
+            "Replace transcript (PDF or DOCX, up to 10 MB)"
+            if current is not None
+            else "Attach transcript (PDF or DOCX, up to 10 MB)"
+        ),
+        type=["pdf", "docx"],
+        key=f"{version_key}_{st.session_state.get(version_key, 0)}",
+    )
+    if st.button(
+        "Replace transcript" if current is not None else "Attach transcript",
+        key=f"interviews_transcript_btn_{feedback_id}",
+        disabled=upload is None,
+    ):
+        _run_attach_transcript(
+            feedback_id, upload.getvalue(), upload.name, acting_user_id
+        )
+
+
+def _render_feedback_history(
+    history: list, transcripts: dict | None = None, acting_user_id=None
+) -> None:
     """Prior write-ups, newest first. Read-only and never edited: CLAUDE.md §7
-    requires the original human feedback to be preserved as written."""
+    requires the original human feedback to be preserved as written.
+
+    ``transcripts`` maps ``feedback_id`` to that round's transcript versions;
+    when it is ``None`` (the pre-Increment-B call shape) no transcript block is
+    drawn at all."""
     if not history:
         st.caption("No interview feedback has been recorded yet.")
         return
@@ -393,6 +587,12 @@ def _render_feedback_history(history: list) -> None:
             if item.notes:
                 st.markdown("*Interview notes*")
                 st.markdown(item.notes)
+            if transcripts is not None:
+                _render_transcript_block(
+                    item.feedback_id,
+                    transcripts.get(item.feedback_id, []),
+                    acting_user_id,
+                )
 
 
 def _render_feedback_form(context, acting_user_id) -> None:
@@ -476,6 +676,16 @@ def _render_feedback_form(context, acting_user_id) -> None:
                 "final hiring decision."
             ),
         )
+        transcript_file = st.file_uploader(
+            _TRANSCRIPT_UPLOAD_LABEL,
+            type=["pdf", "docx"],
+            key=f"fb_transcript_{app_id}",
+            help=(
+                "Optional. Stored in Google Drive and linked to this round. "
+                "The feedback is saved first, so a problem with the file "
+                "never loses it."
+            ),
+        )
 
         if st.form_submit_button("Save interview feedback"):
             _run_submit_feedback(
@@ -486,6 +696,11 @@ def _render_feedback_form(context, acting_user_id) -> None:
                 notes=notes,
                 ratings=_usable_ratings(rating_inputs),
                 acting_user_id=acting_user_id,
+                transcript=(
+                    (transcript_file.name, transcript_file.getvalue())
+                    if transcript_file is not None
+                    else None
+                ),
             )
 
 
@@ -494,6 +709,7 @@ def _render_feedback_section(application_id, feedback_state, acting_user_id) -> 
     state = (feedback_state or {}).get(application_id) or {}
     context = state.get("context")
     history = state.get("history") or []
+    transcripts = state.get("transcripts")
 
     count = len(history)
     title = (
@@ -505,7 +721,12 @@ def _render_feedback_section(application_id, feedback_state, acting_user_id) -> 
             "Recorded by the human interviewer. Preserved exactly as written — "
             "never rewritten or summarised by AI."
         )
-        _render_feedback_history(history)
+        notice = st.session_state.pop(
+            _transcript_notice_key(application_id), None
+        )
+        if notice:
+            st.warning(notice)
+        _render_feedback_history(history, transcripts, acting_user_id)
         if context is None:
             load_error("Couldn't load this candidate's interview feedback.")
             return
@@ -517,6 +738,78 @@ def _render_feedback_section(application_id, feedback_state, acting_user_id) -> 
             return
         st.divider()
         _render_feedback_form(context, acting_user_id)
+
+
+def _rounds_phrase(rounds) -> str:
+    """``round 1`` / ``rounds 1 and 2`` / ``rounds 1, 2 and 3``."""
+    ordered = sorted({int(r) for r in rounds})
+    if not ordered:
+        return "no rounds"
+    if len(ordered) == 1:
+        return f"round {ordered[0]}"
+    return (
+        "rounds " + ", ".join(str(r) for r in ordered[:-1]) + f" and {ordered[-1]}"
+    )
+
+
+def _analysis_scope_text(feedback_rounds, transcript_rounds, legacy: bool) -> str:
+    """What a post-interview analysis actually read, in words. Driven by the
+    stored provenance — never by anything the AI said.
+
+    ``legacy`` is a pre-Increment-C row: it read only the most recent feedback
+    record and no transcripts."""
+    if legacy:
+        latest = (
+            f" (Round {feedback_rounds[0]})" if len(feedback_rounds) == 1 else ""
+        )
+        return (
+            "This earlier analysis read only the most recent feedback record"
+            f"{latest} and no transcripts."
+        )
+    feedback = (
+        f"interviewer feedback for {_rounds_phrase(feedback_rounds)}"
+        if feedback_rounds else "the recorded interviewer feedback"
+    )
+    if transcript_rounds:
+        return (
+            f"Based on {feedback} and the interview transcripts for "
+            f"{_rounds_phrase(transcript_rounds)}."
+        )
+    return (
+        f"Based on {feedback}. No interview transcript was available when "
+        "this analysis was generated."
+    )
+
+
+def _analysis_is_stale(analysis, feedback_state: dict | None) -> bool:
+    """True if the application's feedback records or CURRENT readable transcripts
+    differ from the sets this analysis recorded.
+
+    Transcripts flagged as having no readable text are excluded on the current
+    side: they can never be used, so a scan would otherwise make every analysis
+    look permanently stale. A replaced scan is therefore not flagged. Views that
+    carry no provenance (older shapes) are never reported stale.
+    """
+    if not hasattr(analysis, "feedback_records"):
+        return False
+    state = feedback_state or {}
+    current_feedback = {
+        getattr(item, "feedback_id", None) for item in state.get("history") or []
+    }
+    recorded_feedback = {r.feedback_id for r in analysis.feedback_records}
+    if current_feedback != recorded_feedback:
+        return True
+    transcripts = state.get("transcripts")
+    if transcripts is None:
+        return False
+    current_transcripts = {
+        v.transcript_id
+        for versions in transcripts.values()
+        for v in versions
+        if v.status == InterviewTranscriptStatus.CURRENT and v.text_extractable
+    }
+    recorded_transcripts = {r.transcript_id for r in analysis.transcript_records}
+    return current_transcripts != recorded_transcripts
 
 
 def _render_analysis_body(analysis) -> None:
@@ -544,8 +837,19 @@ def _render_analysis_body(analysis) -> None:
     st.markdown("*Evidence consistency*")
     st.markdown(analysis.evidence_consistency_notes)
 
+    transcript_notes = getattr(analysis, "transcript_evidence_notes", "") or ""
+    if transcript_notes:
+        st.markdown("*From the interview transcripts (AI-generated)*")
+        st.caption(ai_provenance(analysis.created_at))
+        st.markdown(transcript_notes)
+    for round_number in getattr(analysis, "transcript_unreadable_rounds", ()) or ():
+        st.warning(
+            f"The transcript for Round {round_number} had no readable text "
+            "(probably a scan) and was not used in this analysis."
+        )
 
-def _render_analysis(analysis) -> None:
+
+def _render_analysis(analysis, stale: bool = False) -> None:
     """Read-only view of the CURRENT analysis.
 
     The AI recommendation and the interviewer's are shown as two separate,
@@ -558,11 +862,19 @@ def _render_analysis(analysis) -> None:
         f"requested by {analysis.requested_by_name}. AI assessment — one "
         "input for the hiring manager, not a hiring decision."
     )
-    if analysis.analyzed_only_latest_feedback:
-        st.caption(
-            "Based on the most recent interview-feedback record only. If a "
-            "later round has since been recorded, regenerate to include it."
+    records = getattr(analysis, "feedback_records", ()) or ()
+    st.caption(
+        _analysis_scope_text(
+            [r.interview_round for r in records],
+            [
+                r.interview_round
+                for r in getattr(analysis, "transcript_records", ()) or ()
+            ],
+            bool(analysis.analyzed_only_latest_feedback),
         )
+    )
+    if stale:
+        st.warning(_ANALYSIS_STALE)
 
     st.markdown(
         badge(
@@ -575,17 +887,41 @@ def _render_analysis(analysis) -> None:
             f"Confidence: {label_for(analysis.confidence)}",
         )
     )
-    st.markdown(
-        badge(
-            recommendation_kind(analysis.human_recommendation_snapshot),
-            f"Interviewer recommended: "
-            f"{label_for(analysis.human_recommendation_snapshot)}",
+    if records:
+        st.markdown(
+            "Interviewer recommendations: "
+            + "  ".join(
+                badge(
+                    recommendation_kind(r.recommendation_snapshot),
+                    f"Round {r.interview_round} "
+                    f"{label_for(r.recommendation_snapshot)}",
+                )
+                for r in records
+            )
         )
-    )
-    st.caption(
-        "The interviewer's recommendation is shown as recorded, alongside "
-        "the AI's — not merged with it, and not compared against it here."
-    )
+        if analysis.analyzed_only_latest_feedback:
+            st.caption(
+                "Shown as recorded, for context. This earlier analysis could "
+                "see the interviewer's recommendation when it was generated. "
+                "No comparison is made."
+            )
+        else:
+            st.caption(
+                "Shown as recorded, for context. The AI analysis did not see "
+                "these, and no comparison is made."
+            )
+    else:
+        st.markdown(
+            badge(
+                recommendation_kind(analysis.human_recommendation_snapshot),
+                f"Interviewer recommended: "
+                f"{label_for(analysis.human_recommendation_snapshot)}",
+            )
+        )
+        st.caption(
+            "The interviewer's recommendation is shown as recorded, alongside "
+            "the AI's — not merged with it, and not compared against it here."
+        )
     st.divider()
     _render_analysis_body(analysis)
 
@@ -657,7 +993,12 @@ def _render_analysis_section(
             return
 
         if current is not None:
-            _render_analysis(current)
+            _render_analysis(
+                current,
+                stale=_analysis_is_stale(
+                    current, (feedback_state or {}).get(application_id)
+                ),
+            )
             st.divider()
 
         label = (
@@ -881,6 +1222,13 @@ def _render_final_scorecard(view) -> None:
     if view.post_interview_summary:
         st.markdown("#### Post-interview AI analysis")
         st.caption(f"Source: {Provenance.POST_INTERVIEW_AI}")
+        st.caption(
+            _analysis_scope_text(
+                getattr(view, "post_interview_feedback_rounds", ()) or (),
+                getattr(view, "post_interview_transcript_rounds", ()) or (),
+                bool(getattr(view, "post_interview_read_latest_only", False)),
+            )
+        )
         st.markdown(view.post_interview_summary)
         _str_list_block(
             "Strengths", view.post_interview_strengths,
@@ -921,6 +1269,11 @@ def _render_final_scorecard(view) -> None:
             f"**{interview_round_label(view.interview_round)}** — recorded by "
             f"{view.interviewer_name or 'unknown'}{recorded}"
         )
+        transcript_name = getattr(view, "interview_transcript_file_name", None)
+        if transcript_name:
+            st.caption(f"Interview transcript attached: {transcript_name}")
+        else:
+            st.caption("No interview transcript attached to this round.")
         if view.interview_ratings:
             detail_lines(
                 (

@@ -5,8 +5,9 @@ BOUNDARY THIS SCHEMA MUST HOLD
 -----------------------------
 The AI's job here is **consolidation and prose only**: given the candidate's
 whole evaluation record (rubric criteria, résumé evidence, prequalification,
-screening evaluation, screening transcript, and the interviewer's own written
-feedback), write a single joined-up read of the candidate — what holds up
+screening evaluation, screening transcript, EVERY round of the interviewer's
+own written feedback, and the interview transcripts), write a single joined-up
+read of the candidate — what holds up
 across the sources, what does not, and what is still not known.
 
 The AI does **not** decide, and this schema deliberately has **no field for**:
@@ -18,6 +19,13 @@ The AI does **not** decide, and this schema deliberately has **no field for**:
 * any disagreement flag, severity, or AI-vs-human comparison — §8 is a separate
   concern that this step does not implement,
 * anything about the final hiring decision.
+
+Increment C adds exactly ONE field, ``transcript_evidence_notes`` — prose about
+what the interview transcripts added, confirmed or contradicted, by round. It is
+prose like the others: transcript text is qualitative evidence only, and no
+number is ever derived from it. Python requires it to be non-empty when at least
+one readable transcript was supplied (a service-level check, because only the
+service knows whether one was); it is stored as ``''`` when none was.
 
 Same discipline as :mod:`app.ai.schemas.screening_evaluation` and
 :mod:`app.ai.schemas.interview_guide`: the AI supplies only what only the AI can
@@ -84,6 +92,16 @@ class PostInterviewAnalysisAssessment(BaseModel):
     # claim only one source supports. Reasoning, not a verdict; it must not
     # declare a winner between the AI's read and the interviewer's. Non-empty.
     evidence_consistency_notes: str
+
+    # What the interview TRANSCRIPTS added, confirmed or contradicted, by round.
+    # Defaults to "" so a run with no transcript need not invent anything; the
+    # service enforces non-empty when a readable transcript was supplied.
+    transcript_evidence_notes: str = ""
+
+    @field_validator("transcript_evidence_notes")
+    @classmethod
+    def _transcript_notes_trimmed(cls, value: str) -> str:
+        return (value or "").strip()
 
     @field_validator("summary", "evidence_consistency_notes")
     @classmethod

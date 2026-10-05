@@ -2,7 +2,10 @@
 *after* the human interview (CLAUDE.md §9; Phase 4 Step 9).
 
 One row = one run of the ``post_interview_analysis`` AI task for one
-application, against ONE interview-feedback record.
+application. Since Increment C it reads EVERY interview-feedback record of the
+application and the CURRENT transcript of every round that has one; the exact
+sets used are recorded in ``post_interview_analysis_feedback`` and
+``post_interview_analysis_transcripts`` (see below).
 
 WHY REGENERATION IS NON-DESTRUCTIVE — A DELIBERATE DIVERGENCE
 -------------------------------------------------------------
@@ -48,22 +51,43 @@ WHAT THIS TABLE DELIBERATELY DOES NOT HOLD
   ``human_recommendation_snapshot`` is a plain copy of what the interviewer
   recorded, carried for display context only; nothing in this step compares it
   to ``ai_recommendation``.
-* **No interview transcript** — out of scope entirely. The only transcript this
-  step reads is the *screening* transcript, which is an input to the prompt and
-  is not stored here.
+* **No transcript TEXT.** Interview transcripts are read from Google Drive for
+  the prompt and are never stored here or anywhere in Postgres. Only which
+  transcripts were used is recorded (the join table below), plus the AI's own
+  prose about them (``transcript_evidence_notes``).
 
 ``ai_recommendation`` — PROCEED / HOLD only, validated against
 ``ScreeningRecommendation.AUTOMATED``. The AI never returns a recommendation at
 all (its schema has no such field); Python computes this one. REJECT stays a
 human decision (§11) and is unreachable on this path by construction.
 
-``analyzed_only_latest_feedback`` — records that this analysis read exactly one
-feedback record, the latest. It is a stored fact rather than an assumption a
-reader has to make: the HR page renders a caption *from this field* ("Based on
-the most recent interview-feedback record only..."), so the scope of the
-analysis is disclosed on screen. The AI is deliberately NOT asked to state it in
-its prose — nothing in the prompt instructs that — because a disclosure this
-important must not depend on model behaviour.
+``analyzed_only_latest_feedback`` — True only on rows created before
+Increment C, which read exactly one feedback record (the latest) and no
+transcripts. New rows set it False. It stays a stored fact rather than an
+assumption: the HR page picks its disclosure from this field, and from the join
+tables for the exact rounds. The AI is deliberately NOT asked to state scope in
+its prose, because a disclosure this important must not depend on model
+behaviour.
+
+``interview_feedback_id`` — the MOST RECENT feedback record at generation time
+(``created_at DESC, id DESC`` — Step 8's meaning of "latest", which is NOT
+necessarily the highest round). It is an anchor and the source of
+``human_recommendation_snapshot`` only; the full set read is in
+``post_interview_analysis_feedback``.
+
+PROVENANCE TABLES (Increment C)
+-------------------------------
+``post_interview_analysis_feedback`` — one row per feedback record the analysis
+read, with that round's ``recommendation_snapshot``: the interviewer's
+recommendation AT GENERATION TIME, copied from the database. It is display
+context for HR ONLY. The AI never sees any recommendation; the independence is
+limited to that one field (notes, ratings and transcript text can still carry an
+interviewer's opinion).
+
+``post_interview_analysis_transcripts`` — one row per CURRENT transcript that was
+actually sent to the AI (readable ones only). Unreadable rounds are listed in
+``transcript_unreadable_rounds`` instead. Superseded transcripts are never read.
+All FKs on both tables are RESTRICT (the precedent of this table).
 
 PRIVACY (CLAUDE.md §§12, 22, 24)
 --------------------------------
@@ -85,6 +109,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     Text,
     func,
@@ -140,7 +165,10 @@ class PostInterviewAnalysis(Base):
         index=True,
     )
 
-    # The ONE feedback record this analysis read (the latest at generation time).
+    # The MOST RECENT feedback record at generation time (Step 8 "latest":
+    # created_at DESC, id DESC). An anchor and the source of
+    # ``human_recommendation_snapshot`` — NOT the set that was read; see
+    # ``post_interview_analysis_feedback`` for that.
     interview_feedback_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("interview_feedback.id", ondelete="RESTRICT"),
@@ -193,12 +221,24 @@ class PostInterviewAnalysis(Base):
     # PROCEED / HOLD only. Validated against ScreeningRecommendation.AUTOMATED.
     ai_recommendation: Mapped[str] = mapped_column(String(20), nullable=False)
 
-    # A plain copy of the interviewer's own recommendation, for display context.
-    # NOT compared with ai_recommendation anywhere in this step.
+    # A plain copy of the MOST RECENT record's recommendation, from the
+    # database, for display context. Never sent to the AI; NOT compared with
+    # ai_recommendation anywhere.
     human_recommendation_snapshot: Mapped[str] = mapped_column(
         String(20), nullable=False
     )
 
+    # AI prose: what the interview transcripts added, confirmed or contradicted,
+    # by round. '' when no readable transcript was used. Never audited/logged.
+    transcript_evidence_notes: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("''")
+    )
+    # Rounds whose CURRENT transcript had no readable text and was NOT sent.
+    transcript_unreadable_rounds: Mapped[list[int]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+
+    # True only for pre-Increment-C rows (one record, no transcripts).
     analyzed_only_latest_feedback: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
@@ -228,3 +268,46 @@ class PostInterviewAnalysis(Base):
             f"application={self.application_id!r} status={self.status!r} "
             f"rec={self.ai_recommendation!r} conf={self.confidence!r}>"
         )
+
+
+class PostInterviewAnalysisFeedback(Base):
+    """One interview-feedback record that an analysis read (Increment C)."""
+
+    __tablename__ = "post_interview_analysis_feedback"
+
+    analysis_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("post_interview_analyses.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    interview_feedback_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("interview_feedback.id", ondelete="RESTRICT"),
+        primary_key=True,
+        index=True,
+    )
+    interview_round: Mapped[int] = mapped_column(Integer, nullable=False)
+    # The interviewer's recommendation for this round at generation time. Display
+    # context only — from the database, never from or to the AI.
+    recommendation_snapshot: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )
+
+
+class PostInterviewAnalysisTranscript(Base):
+    """One CURRENT interview transcript that was actually sent to the AI."""
+
+    __tablename__ = "post_interview_analysis_transcripts"
+
+    analysis_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("post_interview_analyses.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    interview_transcript_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("interview_transcripts.id", ondelete="RESTRICT"),
+        primary_key=True,
+        index=True,
+    )
+    interview_round: Mapped[int] = mapped_column(Integer, nullable=False)

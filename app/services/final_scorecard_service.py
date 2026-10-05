@@ -92,6 +92,9 @@ from app.services.interview_feedback_service import list_feedback_views
 from app.services.interview_guide_service import (
     get_interview_guide_for_application,
 )
+from app.services.interview_transcript_service import (
+    get_current_transcript_for_feedback,
+)
 from app.services.post_interview_service import (
     get_current_post_interview_analysis,
 )
@@ -362,6 +365,21 @@ class FinalScorecardView:
     # --- what simply isn't there yet ---
     missing_sources: tuple[str, ...]
 
+    # --- interview transcript attachment (Increment B) ---
+    # File name of the CURRENT transcript attached to the SAME (latest) round the
+    # interview block shows, or None when that round has none. Name only: the
+    # file's content is never read here, and there is no download on this page.
+    interview_transcript_file_name: str | None = None
+
+    # --- what the post-interview analysis actually read (Increment C) ---
+    # Rounds of feedback / CURRENT transcripts that informed the displayed
+    # analysis, and whether it is a pre-Increment-C row that read only the most
+    # recent record. Informational only: the Interview SCORE above is unchanged
+    # and still derives from the latest feedback record alone.
+    post_interview_feedback_rounds: tuple[int, ...] = ()
+    post_interview_transcript_rounds: tuple[int, ...] = ()
+    post_interview_read_latest_only: bool = False
+
 
 # --- the one score this module derives (CLAUDE.md §§10, 20) -----------
 
@@ -597,6 +615,16 @@ def get_final_scorecard(
     if latest_feedback is None:
         missing.append("Human interview feedback")
 
+    # Only the file NAME of the latest round's current transcript is surfaced.
+    # Not added to ``missing`` — a transcript is optional, never a required source.
+    latest_transcript = (
+        get_current_transcript_for_feedback(
+            db, latest_feedback.feedback_id, acting_user_id=acting_user_id
+        )
+        if latest_feedback is not None
+        else None
+    )
+
     analysis = get_current_post_interview_analysis(
         db, app_uuid, acting_user_id=acting_user_id
     )
@@ -826,4 +854,18 @@ def get_final_scorecard(
         final_decision_status=FINAL_DECISION_NOT_DECIDED,
         ranking=ranking,
         missing_sources=tuple(missing),
+        interview_transcript_file_name=(
+            latest_transcript.file_name if latest_transcript is not None else None
+        ),
+        post_interview_feedback_rounds=tuple(
+            r.interview_round
+            for r in (getattr(analysis, "feedback_records", None) or ())
+        ),
+        post_interview_transcript_rounds=tuple(
+            r.interview_round
+            for r in (getattr(analysis, "transcript_records", None) or ())
+        ),
+        post_interview_read_latest_only=bool(
+            getattr(analysis, "analyzed_only_latest_feedback", False)
+        ),
     )

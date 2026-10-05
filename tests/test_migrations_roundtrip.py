@@ -935,3 +935,319 @@ def test_job_code_downgrade_leaves_nothing_behind_and_reupgrades(
             ).scalar_one() == "V_001"
     finally:
         engine.dispose()
+
+
+# --- interview_transcripts (migration a8b9c0d1e2f3) --------------------------
+
+_PRE_TRANSCRIPTS = "f7a8b9c0d1e2"
+_TRANSCRIPTS_REV = "a8b9c0d1e2f3"
+_ONE_CURRENT_INDEX = "uq_interview_transcripts_one_current_per_feedback"
+
+
+def test_interview_transcripts_table_and_partial_unique_index_exist_after_upgrade(
+    migrate, temp_database_url
+):
+    migrate("downgrade", "base")
+    migrate("upgrade", "head")
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            cols = {c["name"]: c for c in inspector.get_columns("interview_transcripts")}
+            assert set(cols) == {
+                "id", "interview_feedback_id", "uploaded_by_user_id",
+                "drive_file_id", "drive_folder_id", "file_name", "mime_type",
+                "file_size_bytes", "text_extractable", "status",
+                "superseded_at", "created_at",
+            }
+            assert cols["superseded_at"]["nullable"] is True
+            assert all(
+                not c["nullable"] for n, c in cols.items() if n != "superseded_at"
+            )
+
+            fks = {
+                fk["constrained_columns"][0]: (
+                    fk["referred_table"], fk["options"].get("ondelete")
+                )
+                for fk in inspector.get_foreign_keys("interview_transcripts")
+            }
+            assert fks == {
+                "interview_feedback_id": ("interview_feedback", "RESTRICT"),
+                "uploaded_by_user_id": ("users", "RESTRICT"),
+            }
+
+            definition = conn.execute(sa.text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename = 'interview_transcripts' AND indexname = :n"
+            ), {"n": _ONE_CURRENT_INDEX}).scalar_one()
+            assert "UNIQUE" in definition
+            assert "(interview_feedback_id)" in definition
+            assert "status" in definition and "CURRENT" in definition  # the predicate
+
+            # drive_file_id is unique too
+            uniques = [
+                u["column_names"]
+                for u in inspector.get_unique_constraints("interview_transcripts")
+            ]
+            assert ["drive_file_id"] in uniques
+    finally:
+        engine.dispose()
+
+
+def test_interview_transcripts_upgrade_downgrade_upgrade_roundtrip(
+    migrate, temp_database_url
+):
+    migrate("downgrade", "base")
+    migrate("upgrade", _TRANSCRIPTS_REV)
+    migrate("downgrade", _PRE_TRANSCRIPTS)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert "interview_transcripts" not in sa.inspect(conn).get_table_names()
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_INDEX}).scalar_one() == 0
+            # the table this one points at is untouched
+            assert "interview_feedback" in sa.inspect(conn).get_table_names()
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _TRANSCRIPTS_REV)        # must not raise
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert "interview_transcripts" in sa.inspect(conn).get_table_names()
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_INDEX}).scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+# --- post-interview analysis provenance (migration b9c0d1e2f3a4) -------------
+
+_PRE_PIA = "a8b9c0d1e2f3"
+_PIA_REV = "b9c0d1e2f3a4"
+
+_U = "00000000-0000-0000-0000-0000000000a1"
+_J = "00000000-0000-0000-0000-0000000000a2"
+_L = "00000000-0000-0000-0000-0000000000a3"
+_C = "00000000-0000-0000-0000-0000000000a4"
+_A = "00000000-0000-0000-0000-0000000000a5"
+_RV = "00000000-0000-0000-0000-0000000000a6"
+_SE = "00000000-0000-0000-0000-0000000000a7"
+_G = "00000000-0000-0000-0000-0000000000a8"
+_F1 = "00000000-0000-0000-0000-0000000000b1"
+_F2 = "00000000-0000-0000-0000-0000000000b2"
+_PIA_OLD = "00000000-0000-0000-0000-0000000000c1"
+_PIA_NEW = "00000000-0000-0000-0000-0000000000c2"
+
+
+def _seed_two_analyses(conn):
+    """Raw rows at the pre-migration schema: one application with feedback rounds
+    1 and 2 and TWO analyses (one superseded, anchored at round 1 with snapshot
+    REJECT; one current, anchored at round 2 with snapshot HOLD)."""
+    t = sa.text
+    conn.execute(t(
+        "INSERT INTO users (id, email, hashed_password, full_name, role) "
+        "VALUES (:u, 'hr-mig@x.test', 'x', 'HR Mig', 'HR')"), {"u": _U})
+    conn.execute(t(
+        "INSERT INTO jobs (id, title, jd_source_text, jd_input_method) "
+        "VALUES (:j, 'T', 'x', 'TEXT_PASTE')"), {"j": _J})
+    conn.execute(t(
+        "INSERT INTO application_links (id, job_id, token, sequence_number) "
+        "VALUES (:l, :j, 'tok-mig', 1)"), {"l": _L, "j": _J})
+    conn.execute(t(
+        "INSERT INTO candidates (id, email, full_name) "
+        "VALUES (:c, 'c-mig@x.test', 'Cand Mig')"), {"c": _C})
+    conn.execute(t(
+        "INSERT INTO applications (id, candidate_id, job_id, application_link_id) "
+        "VALUES (:a, :c, :j, :l)"), {"a": _A, "c": _C, "j": _J, "l": _L})
+    conn.execute(t(
+        "INSERT INTO rubric_versions (id, job_id, version_number, "
+        "generated_from_requirements_version) VALUES (:rv, :j, 1, 1)"),
+        {"rv": _RV, "j": _J})
+    conn.execute(t(
+        "INSERT INTO candidate_shortlist_entries (id, job_id, application_id, "
+        "rubric_version_id, is_shortlisted, decided_by_user_id, decided_at) "
+        "VALUES (:se, :j, :a, :rv, true, :u, now())"),
+        {"se": _SE, "j": _J, "a": _A, "rv": _RV, "u": _U})
+    conn.execute(t(
+        "INSERT INTO interview_guides (id, job_id, application_id, "
+        "shortlist_entry_id, rubric_version_id, ai_model, generated_at) "
+        "VALUES (:g, :j, :a, :se, :rv, 'm', now())"),
+        {"g": _G, "j": _J, "a": _A, "se": _SE, "rv": _RV})
+    for fid, rnd, rec in ((_F1, 1, "PROCEED"), (_F2, 2, "HOLD")):
+        conn.execute(t(
+            "INSERT INTO interview_feedback (id, application_id, "
+            "interview_guide_id, submitted_by_user_id, interview_round, "
+            "recommendation) VALUES (:f, :a, :g, :u, :r, :rec)"),
+            {"f": fid, "a": _A, "g": _G, "u": _U, "r": rnd, "rec": rec})
+    for pid, fid, snap, status in (
+        (_PIA_OLD, _F1, "REJECT", "SUPERSEDED"),
+        (_PIA_NEW, _F2, "HOLD", "CURRENT"),
+    ):
+        conn.execute(t(
+            "INSERT INTO post_interview_analyses (id, application_id, "
+            "interview_feedback_id, interview_guide_id, rubric_version_id, "
+            "requested_by_user_id, summary, evidence_consistency_notes, "
+            "confidence, ai_recommendation, human_recommendation_snapshot, "
+            "ai_model, status) VALUES (:p, :a, :f, :g, :rv, :u, 's', 'n', "
+            "'MEDIUM', 'HOLD', :snap, 'm', :st)"),
+            {"p": pid, "a": _A, "f": fid, "g": _G, "rv": _RV, "u": _U,
+             "snap": snap, "st": status})
+
+
+def test_pia_migration_backfills_exactly_one_feedback_row_per_existing_analysis(
+    migrate, temp_database_url
+):
+    _fresh_at(migrate, _PRE_PIA)
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.begin() as conn:
+            _seed_two_analyses(conn)
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _PIA_REV)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(sa.text(
+                "SELECT analysis_id::text, interview_feedback_id::text, "
+                "interview_round, recommendation_snapshot "
+                "FROM post_interview_analysis_feedback ORDER BY interview_round"
+            )).all()
+            # exactly one per analysis; round from the feedback row, snapshot from
+            # the analysis row (NOT the feedback row's own recommendation)
+            assert rows == [
+                (_PIA_OLD, _F1, 1, "REJECT"),
+                (_PIA_NEW, _F2, 2, "HOLD"),
+            ]
+            # no transcripts were read by pre-existing analyses
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM post_interview_analysis_transcripts"
+            )).scalar_one() == 0
+            # existing analyses survive untouched and keep the legacy flag
+            analyses = conn.execute(sa.text(
+                "SELECT id::text, analyzed_only_latest_feedback, "
+                "transcript_evidence_notes, transcript_unreadable_rounds::text, "
+                "status FROM post_interview_analyses ORDER BY status"
+            )).all()
+            assert analyses == [
+                (_PIA_NEW, True, "", "[]", "CURRENT"),
+                (_PIA_OLD, True, "", "[]", "SUPERSEDED"),
+            ]
+    finally:
+        engine.dispose()
+
+
+def test_pia_migration_keys_foreign_keys_and_columns(migrate, temp_database_url):
+    migrate("downgrade", "base")
+    migrate("upgrade", "head")
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+
+            def fks(table):
+                return {
+                    fk["constrained_columns"][0]: (
+                        fk["referred_table"], fk["options"].get("ondelete")
+                    )
+                    for fk in inspector.get_foreign_keys(table)
+                }
+
+            assert fks("post_interview_analysis_feedback") == {
+                "analysis_id": ("post_interview_analyses", "RESTRICT"),
+                "interview_feedback_id": ("interview_feedback", "RESTRICT"),
+            }
+            assert fks("post_interview_analysis_transcripts") == {
+                "analysis_id": ("post_interview_analyses", "RESTRICT"),
+                "interview_transcript_id": ("interview_transcripts", "RESTRICT"),
+            }
+            assert inspector.get_pk_constraint("post_interview_analysis_feedback")[
+                "constrained_columns"
+            ] == ["analysis_id", "interview_feedback_id"]
+            assert inspector.get_pk_constraint(
+                "post_interview_analysis_transcripts"
+            )["constrained_columns"] == ["analysis_id", "interview_transcript_id"]
+
+            # no text is stored in either table
+            for table in (
+                "post_interview_analysis_feedback",
+                "post_interview_analysis_transcripts",
+            ):
+                types = {
+                    c["name"]: str(c["type"]).upper()
+                    for c in inspector.get_columns(table)
+                }
+                assert not any("TEXT" in t for t in types.values()), (table, types)
+            fb_cols = {
+                c["name"]: c for c in inspector.get_columns(
+                    "post_interview_analysis_feedback"
+                )
+            }
+            assert set(fb_cols) == {
+                "analysis_id", "interview_feedback_id", "interview_round",
+                "recommendation_snapshot",
+            }
+            assert all(not c["nullable"] for c in fb_cols.values())
+
+            analyses = {
+                c["name"]: c for c in inspector.get_columns("post_interview_analyses")
+            }
+            for name in ("transcript_evidence_notes", "transcript_unreadable_rounds"):
+                assert analyses[name]["nullable"] is False
+            assert "''" in analyses["transcript_evidence_notes"]["default"]
+            assert "'[]'" in analyses["transcript_unreadable_rounds"]["default"]
+            # the anchor column keeps its NOT NULL
+            assert analyses["interview_feedback_id"]["nullable"] is False
+    finally:
+        engine.dispose()
+
+
+def test_pia_migration_upgrade_downgrade_upgrade_roundtrip(
+    migrate, temp_database_url
+):
+    _fresh_at(migrate, _PRE_PIA)
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.begin() as conn:
+            _seed_two_analyses(conn)
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _PIA_REV)
+    migrate("downgrade", _PRE_PIA)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            tables = set(inspector.get_table_names())
+            assert "post_interview_analysis_feedback" not in tables
+            assert "post_interview_analysis_transcripts" not in tables
+            cols = {c["name"] for c in inspector.get_columns("post_interview_analyses")}
+            assert "transcript_evidence_notes" not in cols
+            assert "transcript_unreadable_rounds" not in cols
+            # the analyses themselves survive the downgrade
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM post_interview_analyses"
+            )).scalar_one() == 2
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _PIA_REV)          # must not raise, and backfills again
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM post_interview_analysis_feedback"
+            )).scalar_one() == 2
+    finally:
+        engine.dispose()

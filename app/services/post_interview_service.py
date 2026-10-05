@@ -6,23 +6,55 @@ WHAT THIS STEP DOES
 -------------------
 Gathers everything already on record for one application — the rubric criteria
 the candidate was evaluated against, the résumé evidence, the prequalification
-verdicts, the screening evaluation, the full screening transcript, and the ONE
-latest human interview-feedback write-up — asks Claude for a consolidated prose
-read, validates it, computes ``confidence`` and ``ai_recommendation`` in Python,
-and stores the result with exactly one
+verdicts, the screening evaluation, the full screening transcript, EVERY round of
+human interview feedback (notes, ratings and rating comments) and the CURRENT
+interview transcript of every round that has one — asks Claude for a
+consolidated prose read, validates it, computes ``confidence`` and
+``ai_recommendation`` in Python, and stores the result with exactly one
 ``POST_INTERVIEW_ANALYSIS_COMPLETED`` audit event.
+
+INCREMENT C — TWO DELIBERATE REVERSALS OF THE ORIGINAL STEP 9
+-------------------------------------------------------------
+Approved by the product owner; every test that pinned the old behaviour was
+changed deliberately.
+
+1. **All rounds, not the latest only.** The original "latest feedback only"
+   decision is reversed. Every feedback record is read, ordered by
+   ``interview_round`` ascending, plus the CURRENT (never a SUPERSEDED)
+   transcript of each round. Exactly which were used is recorded in
+   ``post_interview_analysis_feedback`` / ``post_interview_analysis_transcripts``.
+   "Most recent record" keeps its Step 8 meaning (``created_at DESC, id DESC``,
+   NOT necessarily the highest round) and is used only for the anchor column
+   ``interview_feedback_id`` and ``human_recommendation_snapshot``.
+2. **The interviewer's recommendation is no longer sent to the AI.** It is still
+   read from the database and stored (per round, in the feedback join table, and
+   the latest one in ``human_recommendation_snapshot``) purely so HR can see it
+   as plain context. HONEST LIMIT: this withholds only the explicit
+   recommendation field. Notes, ratings and transcript text can still carry the
+   interviewers' opinions, so the AI's independence is limited to that one field
+   and is not absolute.
+
+Transcript text is additional QUALITATIVE evidence and UNTRUSTED (words spoken in
+an interview): strengths, gaps and unknowns may change because of it, but no
+number is ever derived from it, the AI-facing schema has no score / confidence /
+recommendation field, and Python still decides ``confidence`` and
+``ai_recommendation`` afterwards. Transcript text is fetched from Drive for the
+prompt and is never stored or logged.
 
 WHAT THIS STEP DELIBERATELY DOES *NOT* DO
 -----------------------------------------
 * **No AI/human disagreement detection of any kind.** No flag, no severity, no
   comparison. ``AI_HUMAN_DISAGREEMENT_DETECTED`` stays declared-but-unemitted,
-  and ``human_recommendation_snapshot`` is a plain copy carried for display
-  context — nothing here compares it to ``ai_recommendation``. §8 is a separate
-  step.
-* **No interview transcript.** Out of scope entirely. The only transcript read
-  here is the *screening* transcript, which is prompt input and is not stored.
+  and the human recommendations are plain copies carried for display context —
+  nothing here compares them to ``ai_recommendation``, and none is ever sent to
+  the AI. §8 is a separate step.
+* **No numeric score from transcripts, and no storage of transcript text.**
+  Transcripts are prompt input only. (The *screening* transcript is likewise
+  prompt input and is not stored.)
 * **No final scorecard, no ranking, no final decision, no candidate-facing
   output.** This artefact is internal/HR-only.
+* **No auto-regeneration.** Adding a feedback round or a transcript later does
+  NOT re-run the analysis; the HR page flags a stale analysis and HR decides.
 * **No ``Application.status`` write** — this module never touches that column,
   matching ``interview_feedback_service`` and ``shortlist_service``.
 
@@ -103,11 +135,18 @@ from app.database.models.interview_guide import InterviewGuide
 from app.database.models.job_requirement import RequirementType
 from app.database.models.post_interview_analysis import (
     PostInterviewAnalysis,
+    PostInterviewAnalysisFeedback,
     PostInterviewAnalysisStatus,
+    PostInterviewAnalysisTranscript,
 )
 from app.database.models.screening_evaluation import ScreeningRecommendation
 from app.database.models.user import SYSTEM_USER_ID, User, UserRole
 from app.services.audit_service import record_event
+from app.services.interview_transcript_service import (
+    InterviewTranscriptError,
+    TranscriptTextForAnalysis,
+    get_transcript_texts_for_analysis,
+)
 from app.services.prequalification_service import (
     get_prequalification_for_application,
 )
@@ -155,6 +194,20 @@ _ANALYSIS_UNUSABLE = (
 )
 
 
+_ROUNDS_TOO_LONG_FILE = (
+    "The interview transcript for {rounds} is too long to analyse "
+    "({detail}; the limit is {limit:,} characters per file). Attach a shorter "
+    "transcript for that round, then try again. Nothing was changed."
+)
+_ROUNDS_TOO_LONG_TOTAL = (
+    "The interview material across all rounds is too long to analyse "
+    "({total:,} characters; the combined limit is {limit:,}). By round: "
+    "{detail}. Attach shorter transcripts or shorten the interview notes, then "
+    "try again. Nothing was changed."
+)
+_TRANSCRIPT_NOTES_MISSING_LOG = "failure=transcript_notes_missing"
+
+
 class PostInterviewAnalysisError(Exception):
     """The analysis could not be produced or read. Carries a user-safe message;
     never wraps interviewer notes, candidate text, résumé content, or raw model
@@ -170,12 +223,119 @@ class PostInterviewAnalysisPreconditionError(PostInterviewAnalysisError):
     evaluation record)."""
 
 
+class PostInterviewAnalysisInputTooLargeError(PostInterviewAnalysisError):
+    """The human-sourced text (notes, rating comments, transcripts) exceeds a cap.
+    Raised BEFORE the AI call, so nothing is persisted and no call is made."""
+
+
 class PostInterviewAnalysisActorError(PostInterviewAnalysisError):
     """The actor passed the internal-user guard but may not request an analysis
     (the SYSTEM pipeline actor)."""
 
 
+# --- input-size caps (CLAUDE.md §29 cost control) ---------------------
+
+
+#: Per-transcript cap, in characters of EXTRACTED text. Why 60,000: nothing else
+#: in this codebase caps AI input at all (résumé text, screening answers and
+#: interviewer notes are passed through whole), so this is a new, deliberate
+#: guard. The only existing bound is the 10 MB UPLOAD limit, which says nothing
+#: about text (a 10 MB text-heavy PDF can hold millions of characters). A one-hour
+#: interview is roughly 8-9,000 spoken words, about 50-55,000 characters with
+#: speaker labels, so 60,000 admits a normal hour-long transcript and rejects a
+#: file that is plainly something else (a book, a log dump).
+MAX_TRANSCRIPT_CHARS_PER_FILE = 60_000
+
+#: Cap on ALL human-sourced text sent in one call: every round's notes and
+#: rating comments plus all transcript text. Why 200,000: about 50,000 tokens,
+#: i.e. three to four full one-hour transcripts plus notes, comfortably inside
+#: the model's context alongside the ~15,000-token rest of the prompt, and a
+#: bound on per-call cost. Exceeding it raises an error naming the rounds; it is
+#: never truncated silently (truncating testimony would misrepresent it).
+MAX_HUMAN_EVIDENCE_CHARS_TOTAL = 200_000
+
+
+def _rounds_text(rounds: list[int]) -> str:
+    ordered = sorted(set(rounds))
+    if len(ordered) == 1:
+        return f"Round {ordered[0]}"
+    return "Rounds " + ", ".join(str(r) for r in ordered)
+
+
+def _round_text_chars(round_record: dict) -> int:
+    """Characters of human-written text in one round's feedback (notes plus
+    rating comments)."""
+    total = len((round_record.get("notes") or "").strip())
+    for rating in round_record.get("ratings") or []:
+        total += len((rating.get("comment") or "").strip())
+    return total
+
+
+def check_human_evidence_caps(
+    feedback_rounds: list[dict],
+    transcript_texts: list[TranscriptTextForAnalysis],
+) -> None:
+    """Raise :class:`PostInterviewAnalysisInputTooLargeError` if any transcript
+    exceeds :data:`MAX_TRANSCRIPT_CHARS_PER_FILE`, or all human-sourced text
+    together exceeds :data:`MAX_HUMAN_EVIDENCE_CHARS_TOTAL`. Exactly AT a limit is
+    allowed. Pure; the message names rounds and counts, never any text."""
+    too_long = [
+        t for t in transcript_texts if len(t.text) > MAX_TRANSCRIPT_CHARS_PER_FILE
+    ]
+    if too_long:
+        raise PostInterviewAnalysisInputTooLargeError(
+            _ROUNDS_TOO_LONG_FILE.format(
+                rounds=_rounds_text([t.interview_round for t in too_long]),
+                detail=", ".join(
+                    f"Round {t.interview_round}: {len(t.text):,} characters"
+                    for t in too_long
+                ),
+                limit=MAX_TRANSCRIPT_CHARS_PER_FILE,
+            )
+        )
+
+    per_round: dict[int, int] = {}
+    for record in feedback_rounds:
+        n = record.get("interview_round")
+        per_round[n] = per_round.get(n, 0) + _round_text_chars(record)
+    for t in transcript_texts:
+        per_round[t.interview_round] = (
+            per_round.get(t.interview_round, 0) + len(t.text)
+        )
+    total = sum(per_round.values())
+    if total > MAX_HUMAN_EVIDENCE_CHARS_TOTAL:
+        raise PostInterviewAnalysisInputTooLargeError(
+            _ROUNDS_TOO_LONG_TOTAL.format(
+                total=total,
+                limit=MAX_HUMAN_EVIDENCE_CHARS_TOTAL,
+                detail=", ".join(
+                    f"Round {n}: {c:,}"
+                    for n, c in sorted(per_round.items(), key=lambda kv: kv[0])
+                ),
+            )
+        )
+
+
 # --- row shapes (safe outside a Session) ------------------------------
+
+
+@dataclass(frozen=True)
+class AnalysisFeedbackRef:
+    """One feedback record an analysis read. ``recommendation_snapshot`` is the
+    interviewer's recommendation at generation time — display context only, never
+    sent to the AI."""
+
+    feedback_id: uuid.UUID
+    interview_round: int
+    recommendation_snapshot: str
+
+
+@dataclass(frozen=True)
+class AnalysisTranscriptRef:
+    """One CURRENT transcript that was actually sent to the AI."""
+
+    transcript_id: uuid.UUID
+    interview_round: int
 
 
 @dataclass(frozen=True)
@@ -207,6 +367,11 @@ class PostInterviewAnalysisView:
     requested_by_user_id: uuid.UUID
     requested_by_name: str
     created_at: datetime
+    # --- Increment C provenance (defaults keep older constructors valid) ---
+    transcript_evidence_notes: str = ""
+    transcript_unreadable_rounds: tuple[int, ...] = ()
+    feedback_records: tuple[AnalysisFeedbackRef, ...] = ()
+    transcript_records: tuple[AnalysisTranscriptRef, ...] = ()
 
 
 # --- deterministic rules (pure functions — CLAUDE.md §§20, 21) --------
@@ -225,6 +390,7 @@ def compute_post_interview_confidence(
     has_substantive_notes: bool,
     rating_count: int,
     unknown_count: int,
+    transcript_used: bool,
 ) -> str:
     """Return HIGH / MEDIUM / LOW for the consolidated post-interview read.
 
@@ -235,11 +401,27 @@ def compute_post_interview_confidence(
     The question this answers is *"how complete and consistent is the evidence
     base underneath this consolidated read?"* — not "how good is the candidate".
 
+    AGGREGATION ACROSS ROUNDS (Increment C — an explicit choice)
+    ------------------------------------------------------------
+    The analysis reads every round, so the inputs are aggregates:
+
+    * ``has_substantive_notes`` is True if ANY round's notes reach
+      :data:`MIN_NOTES_CHARS` (one well-documented round is enough to show the
+      interview produced checkable evidence; averaging would let a thin extra
+      round dilute a rich one),
+    * ``rating_count`` is the TOTAL number of competency ratings across ALL
+      rounds,
+    * ``transcript_used`` is True if at least one READABLE transcript was sent to
+      the AI (an unreadable scan was not sent and does not count).
+
     THE RULE SET (evaluated in order)
     ---------------------------------
-    1. **LOW** — the interviewer recorded neither substantive notes nor a single
-       competency rating. The interview added no checkable evidence, so a
-       "post-interview" analysis rests on exactly the pre-interview record and
+    1. **LOW** — the interviews added no checkable evidence: no round has
+       substantive notes, there is not a single competency rating, AND no
+       readable transcript was used. (A transcript counts as added evidence, so a
+       round the interviewer did not type up is not forced to LOW when its
+       transcript was read. Before Increment C this rule had no transcript term.)
+       The analysis would otherwise rest on exactly the pre-interview record and
        must not claim more certainty than the screening already had.
     2. **LOW** — the screening evaluation's own overall confidence was LOW *and*
        unknowns remain after the interview. A weak evidence base that the
@@ -247,7 +429,9 @@ def compute_post_interview_confidence(
     3. **HIGH** — the screening evaluation was HIGH-confidence, the interviewer
        left substantive notes *and* at least one competency rating, *and* the
        analysis lists no remaining unknowns. Every source is present and nothing
-       is outstanding.
+       is outstanding. UNCHANGED by Increment C: a transcript alone can never
+       produce HIGH, because HIGH still requires the interviewer's own notes AND
+       a rating — transcript text is untrusted, qualitative and unscored.
     4. **MEDIUM** — everything else.
 
     KNOWN LIMITATION (documented on purpose)
@@ -257,7 +441,9 @@ def compute_post_interview_confidence(
     crude-but-reproducible signal ``compute_confidence`` uses, and the rules are
     likewise biased toward MEDIUM/LOW rather than toward HIGH.
     """
-    interview_added_evidence = has_substantive_notes or rating_count > 0
+    interview_added_evidence = (
+        has_substantive_notes or rating_count > 0 or transcript_used
+    )
 
     # Rule 1: the interview contributed nothing checkable.
     if not interview_added_evidence:
@@ -291,10 +477,11 @@ def compute_post_interview_recommendation(
     REJECT is a human decision (CLAUDE.md §§4, 11) and is unreachable on this
     path by construction, exactly as in ``screening_scoring``.
 
-    The human interviewer's own recommendation is deliberately **not an input**.
-    Echoing it would make this a restatement of the human's view rather than an
-    independent AI read, and comparing against it would be §8's disagreement
-    detection, which this step does not implement.
+    No human interviewer's recommendation is an input — and, since Increment C,
+    none is sent to the AI either. Echoing one would make this a restatement of
+    the human's view rather than an independent AI read, and comparing against it
+    would be §8's disagreement detection, which this step does not implement.
+    The rules below are UNCHANGED by Increment C.
 
     THE RULE SET (evaluated in order)
     ---------------------------------
@@ -396,17 +583,15 @@ def _evaluation_projection(evaluation) -> dict:
 def _latest_feedback_row(
     db: Session, application_id: uuid.UUID
 ) -> InterviewFeedback | None:
-    """The most recent feedback write-up for the application, or ``None``.
+    """The MOST RECENT feedback write-up for the application, or ``None``.
 
     ``created_at DESC, id DESC`` — byte-for-byte the ordering
     ``interview_feedback_service._ordered_feedback_rows`` uses, so "latest" means
-    the same thing in both modules. The id breaks the tie for two rows written in
-    one transaction, which share Postgres' transaction-start ``now()``.
+    the same thing in both modules (and is NOT necessarily the highest round).
+    Used here only for the anchor column and ``human_recommendation_snapshot``.
 
     Read directly rather than through the Step 8 accessor because the actor has
-    already been guarded by :func:`_require_human_actor` at the entry point;
-    going through the accessor would re-run ``require_internal_user`` for no
-    added protection.
+    already been guarded by :func:`_require_human_actor` at the entry point.
     """
     return db.execute(
         select(InterviewFeedback)
@@ -419,8 +604,27 @@ def _latest_feedback_row(
     ).scalar_one_or_none()
 
 
+def _all_feedback_rows(
+    db: Session, application_id: uuid.UUID
+) -> list[InterviewFeedback]:
+    """Every feedback write-up for the application, ``interview_round`` ASCENDING
+    (``id`` only as a deterministic tiebreak; ``(application_id, round)`` is
+    unique so ties cannot occur in practice)."""
+    return list(
+        db.execute(
+            select(InterviewFeedback)
+            .where(InterviewFeedback.application_id == application_id)
+            .order_by(InterviewFeedback.interview_round, InterviewFeedback.id)
+        ).scalars().all()
+    )
+
+
 def _feedback_projection(db: Session, feedback: InterviewFeedback) -> dict:
-    """Plain dict of the ONE feedback row for the prompt.
+    """Plain dict of ONE feedback row for the PROMPT: round, notes, ratings.
+
+    Deliberately carries NO recommendation. The prompt-facing structure and the
+    storage/display structure (:func:`_feedback_snapshot`) are separate so the
+    interviewer's PROCEED/HOLD/REJECT cannot reach the model by accident.
 
     The interviewer's ``notes`` and each rating ``comment`` are passed through
     **verbatim** — CLAUDE.md §7: the original human feedback must be preserved,
@@ -435,7 +639,6 @@ def _feedback_projection(db: Session, feedback: InterviewFeedback) -> dict:
     )
     return {
         "interview_round": feedback.interview_round,
-        "recommendation": feedback.recommendation,
         "notes": feedback.notes,
         "ratings": [
             {
@@ -445,6 +648,16 @@ def _feedback_projection(db: Session, feedback: InterviewFeedback) -> dict:
             }
             for r in ratings
         ],
+    }
+
+
+def _feedback_snapshot(feedback: InterviewFeedback) -> dict:
+    """The STORAGE/DISPLAY side of a feedback row: id, round and the interviewer's
+    recommendation, read from the database. Never passed to the prompt builder."""
+    return {
+        "interview_feedback_id": feedback.id,
+        "interview_round": feedback.interview_round,
+        "recommendation": feedback.recommendation,
     }
 
 
@@ -472,8 +685,31 @@ def _current_analysis_row(
 
 
 def _to_view(
-    analysis: PostInterviewAnalysis, requested_by_name: str
+    db: Session, analysis: PostInterviewAnalysis, requested_by_name: str
 ) -> PostInterviewAnalysisView:
+    feedback_records = tuple(
+        AnalysisFeedbackRef(
+            feedback_id=row.interview_feedback_id,
+            interview_round=row.interview_round,
+            recommendation_snapshot=row.recommendation_snapshot,
+        )
+        for row in db.execute(
+            select(PostInterviewAnalysisFeedback)
+            .where(PostInterviewAnalysisFeedback.analysis_id == analysis.id)
+            .order_by(PostInterviewAnalysisFeedback.interview_round)
+        ).scalars().all()
+    )
+    transcript_records = tuple(
+        AnalysisTranscriptRef(
+            transcript_id=row.interview_transcript_id,
+            interview_round=row.interview_round,
+        )
+        for row in db.execute(
+            select(PostInterviewAnalysisTranscript)
+            .where(PostInterviewAnalysisTranscript.analysis_id == analysis.id)
+            .order_by(PostInterviewAnalysisTranscript.interview_round)
+        ).scalars().all()
+    )
     return PostInterviewAnalysisView(
         analysis_id=analysis.id,
         application_id=analysis.application_id,
@@ -495,6 +731,12 @@ def _to_view(
         requested_by_user_id=analysis.requested_by_user_id,
         requested_by_name=requested_by_name,
         created_at=analysis.created_at,
+        transcript_evidence_notes=analysis.transcript_evidence_notes or "",
+        transcript_unreadable_rounds=tuple(
+            analysis.transcript_unreadable_rounds or []
+        ),
+        feedback_records=feedback_records,
+        transcript_records=transcript_records,
     )
 
 
@@ -527,19 +769,28 @@ def create_post_interview_analysis(
     ``force=True`` the existing row is marked ``SUPERSEDED`` and a new ``CURRENT``
     row is inserted in the same transaction; nothing is ever deleted.
 
-    Only the ONE latest interview-feedback record is analysed. That is recorded
-    on the row as ``analyzed_only_latest_feedback`` so a reader never has to
-    assume it.
+    EVERY interview-feedback record is analysed (rounds ascending), plus the
+    CURRENT transcript of every round that has one. What was used is recorded in
+    ``post_interview_analysis_feedback`` / ``post_interview_analysis_transcripts``
+    and the row is stamped ``analyzed_only_latest_feedback = False``. The most
+    recent record (Step 8 meaning) supplies the anchor ``interview_feedback_id``,
+    the guide / rubric path and ``human_recommendation_snapshot``. No
+    recommendation is sent to the AI.
+
+    Never auto-regenerated when feedback or a transcript is added later.
 
     The rubric version is resolved through the guide the feedback was recorded
     against (``interview_feedback.interview_guide_id ->
     interview_guides.rubric_version_id``) and frozen on the row — never
     re-derived from the job's currently-approved rubric.
 
-    Every input is resolved and every precondition checked **before** the Claude
-    call, and the Claude call happens **before** the first ``db.add`` — so a
-    failure at any stage leaves the existing analysis and all interview feedback
-    exactly as they were.
+    Order: feedback -> rubric / evaluation preconditions -> transcript texts (Drive)
+    -> size caps -> prompt -> ONE Claude call -> validate -> compute -> persist.
+    Every input is resolved and every precondition and cap checked **before** the
+    Claude call, and the Claude call happens **before** the first ``db.add`` — so a
+    failure at any stage (including a Drive failure or an over-long input) leaves
+    the existing analysis and all interview feedback exactly as they were, and an
+    over-long input makes no AI call at all.
 
     Raises
     ------
@@ -551,8 +802,11 @@ def create_post_interview_analysis(
         No such application.
     PostInterviewAnalysisPreconditionError
         No interview feedback yet, or an incomplete evaluation record.
+    PostInterviewAnalysisInputTooLargeError
+        A transcript, or all human-sourced text together, exceeds its cap.
     PostInterviewAnalysisError
-        The Claude call failed, or its output failed validation.
+        The Claude call failed, its output failed validation, or a transcript
+        could not be fetched from Drive.
     """
     # 1. actor — internal user, and a human one.
     actor = _require_human_actor(db, user_id)
@@ -568,15 +822,16 @@ def create_post_interview_analysis(
     if existing is not None and not force:
         return existing
 
-    # 4. the ONE latest human feedback record. Required: this step exists only
-    #    because an interview happened.
-    feedback = _latest_feedback_row(db, application_uuid)
-    if feedback is None:
+    # 4. every human feedback record, rounds ascending. Required: this step exists
+    #    only because an interview happened.
+    feedback_rows = _all_feedback_rows(db, application_uuid)
+    if not feedback_rows:
         raise PostInterviewAnalysisPreconditionError(_NO_FEEDBACK)
+    # "Most recent" keeps its Step 8 meaning — NOT necessarily the highest round.
+    feedback = _latest_feedback_row(db, application_uuid)
 
-    # 5. the guide that feedback was recorded against, and — through it — the
-    #    rubric version. interview_feedback carries no rubric_version_id, and
-    #    this step does not modify that table.
+    # 5. the guide the MOST RECENT feedback was recorded against, and — through it
+    #    — the rubric version. interview_feedback carries no rubric_version_id.
     guide = db.get(InterviewGuide, feedback.interview_guide_id)
     if guide is None or guide.rubric_version_id is None:
         logger.warning(
@@ -622,7 +877,30 @@ def create_post_interview_analysis(
             )
         ]
 
-    feedback_projection = _feedback_projection(db, feedback)
+    # Prompt-facing (NO recommendation) and storage-facing structures are kept
+    # apart on purpose.
+    feedback_rounds = [_feedback_projection(db, row) for row in feedback_rows]
+    feedback_snapshots = [_feedback_snapshot(row) for row in feedback_rows]
+
+    # 7. interview transcripts (CURRENT only), fetched from Drive. A Drive
+    #    failure RAISES: never proceed as if an existing transcript were absent.
+    try:
+        transcript_texts = get_transcript_texts_for_analysis(
+            db, application_uuid, acting_user_id=actor.id
+        )
+    except InterviewTranscriptError as exc:
+        logger.warning(
+            "post_interview_analysis application=%s failure=transcript_fetch",
+            application_uuid,
+        )
+        raise PostInterviewAnalysisError(str(exc)) from exc
+    sent_transcripts = [t for t in transcript_texts if t.readable]
+    unreadable_rounds = sorted(
+        t.interview_round for t in transcript_texts if not t.readable
+    )
+
+    # 8. size caps — BEFORE the AI call. Never truncated silently.
+    check_human_evidence_caps(feedback_rounds, sent_transcripts)
 
     # --- AI call (still no write) --------------------------------------
     prompt = build_post_interview_analysis_prompt(
@@ -631,7 +909,11 @@ def create_post_interview_analysis(
         prequalification_result=prequal.results,
         screening_evaluation=_evaluation_projection(evaluation),
         screening_transcript=transcript_dicts,
-        interview_feedback=feedback_projection,
+        interview_feedback_rounds=feedback_rounds,
+        interview_transcripts=[
+            {"interview_round": t.interview_round, "text": t.text}
+            for t in sent_transcripts
+        ],
     )
     try:
         assessment: PostInterviewAnalysisAssessment = get_structured_response(
@@ -649,13 +931,29 @@ def create_post_interview_analysis(
         )
         raise PostInterviewAnalysisError(_ANALYSIS_UNAVAILABLE) from exc
 
+    # Required by Python when a readable transcript was supplied (the schema
+    # cannot know that). Same invalid-output handling as any other bad response.
+    if sent_transcripts and not assessment.transcript_evidence_notes:
+        logger.warning(
+            "post_interview_analysis application=%s %s",
+            application_uuid, _TRANSCRIPT_NOTES_MISSING_LOG,
+        )
+        raise PostInterviewAnalysisError(_ANALYSIS_UNUSABLE)
+    # With no transcript supplied there is nothing to report; store ''.
+    transcript_evidence_notes = (
+        assessment.transcript_evidence_notes if sent_transcripts else ""
+    )
+
     # --- Python decides (§20) ------------------------------------------
-    notes = (feedback.notes or "").strip()
     confidence = compute_post_interview_confidence(
         screening_confidence=evaluation.overall_confidence,
-        has_substantive_notes=len(notes) >= MIN_NOTES_CHARS,
-        rating_count=len(feedback_projection["ratings"]),
+        has_substantive_notes=any(
+            len((r["notes"] or "").strip()) >= MIN_NOTES_CHARS
+            for r in feedback_rounds
+        ),
+        rating_count=sum(len(r["ratings"]) for r in feedback_rounds),
         unknown_count=len(assessment.unknowns),
+        transcript_used=bool(sent_transcripts),
     )
     ai_recommendation = compute_post_interview_recommendation(
         screening_results=list(evaluation.results or []),
@@ -679,6 +977,7 @@ def create_post_interview_analysis(
 
     analysis = PostInterviewAnalysis(
         application_id=application_uuid,
+        # The MOST RECENT record (Step 8 meaning): an anchor, not the set read.
         interview_feedback_id=feedback.id,
         interview_guide_id=guide.id,
         rubric_version_id=guide.rubric_version_id,
@@ -688,20 +987,44 @@ def create_post_interview_analysis(
         gaps=list(assessment.gaps),
         unknowns=list(assessment.unknowns),
         evidence_consistency_notes=assessment.evidence_consistency_notes,
+        transcript_evidence_notes=transcript_evidence_notes,
+        transcript_unreadable_rounds=unreadable_rounds,
         confidence=confidence,
         ai_recommendation=ai_recommendation,
-        # A plain copy for display context. NOT compared with ai_recommendation
-        # anywhere in this step — §8 is a separate concern.
+        # A plain copy from the database for display context. Never sent to the
+        # AI; NOT compared with ai_recommendation anywhere.
         human_recommendation_snapshot=feedback.recommendation,
-        analyzed_only_latest_feedback=True,
+        analyzed_only_latest_feedback=False,
         ai_model=_resolve_model(_TASK_NAME, None),
         status=PostInterviewAnalysisStatus.CURRENT,
     )
     db.add(analysis)
     db.flush()
 
+    # Provenance: every feedback record read (with its round's recommendation
+    # snapshot, from the database) and every transcript actually sent.
+    for snap in feedback_snapshots:
+        db.add(
+            PostInterviewAnalysisFeedback(
+                analysis_id=analysis.id,
+                interview_feedback_id=snap["interview_feedback_id"],
+                interview_round=snap["interview_round"],
+                recommendation_snapshot=snap["recommendation"],
+            )
+        )
+    for t in sent_transcripts:
+        db.add(
+            PostInterviewAnalysisTranscript(
+                analysis_id=analysis.id,
+                interview_transcript_id=t.transcript_id,
+                interview_round=t.interview_round,
+            )
+        )
+    db.flush()
+
     # Exactly one audit event — structural metadata only. No summary, no
-    # strengths/gaps/unknowns, no notes, no candidate name.
+    # strengths/gaps/unknowns, no notes, no transcript text, no file names, no
+    # candidate name.
     record_event(
         db,
         event_type=AuditEventType.POST_INTERVIEW_ANALYSIS_COMPLETED,
@@ -722,7 +1045,12 @@ def create_post_interview_analysis(
             "confidence": confidence,
             "ai_recommendation": ai_recommendation,
             "human_recommendation_snapshot": feedback.recommendation,
-            "analyzed_only_latest_feedback": True,
+            "analyzed_only_latest_feedback": False,
+            "feedback_count": len(feedback_snapshots),
+            "feedback_rounds": [s_["interview_round"] for s_ in feedback_snapshots],
+            "transcript_count": len(sent_transcripts),
+            "transcript_rounds": [t.interview_round for t in sent_transcripts],
+            "transcripts_unreadable_count": len(unreadable_rounds),
             "strength_count": len(assessment.strengths),
             "gap_count": len(assessment.gaps),
             "unknown_count": len(assessment.unknowns),
@@ -738,9 +1066,10 @@ def create_post_interview_analysis(
     db.refresh(analysis)
     logger.info(
         "post_interview_analysis application=%s confidence=%s recommendation=%s "
-        "unknowns=%d regenerated=%s actor=%s",
+        "unknowns=%d feedback=%d transcripts=%d regenerated=%s actor=%s",
         application_uuid, confidence, ai_recommendation,
-        len(assessment.unknowns), existing is not None, actor.id,
+        len(assessment.unknowns), len(feedback_snapshots), len(sent_transcripts),
+        existing is not None, actor.id,
     )
     return analysis
 
@@ -765,7 +1094,9 @@ def get_current_post_interview_analysis(
     analysis = _current_analysis_row(db, _as_uuid(application_id))
     if analysis is None:
         return None
-    return _to_view(analysis, _display_name(db, analysis.requested_by_user_id))
+    return _to_view(
+        db, analysis, _display_name(db, analysis.requested_by_user_id)
+    )
 
 
 def get_post_interview_analysis_history(
@@ -793,5 +1124,6 @@ def get_post_interview_analysis_history(
         ).scalars().all()
     )
     return [
-        _to_view(row, _display_name(db, row.requested_by_user_id)) for row in rows
+        _to_view(db, row, _display_name(db, row.requested_by_user_id))
+        for row in rows
     ]

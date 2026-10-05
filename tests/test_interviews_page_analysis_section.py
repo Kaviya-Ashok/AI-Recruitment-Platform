@@ -276,21 +276,20 @@ def test_page_states_the_analysis_does_not_decide():
 # --- scope disclosure (Step 9 requirement #5) ------------------------
 
 
-def test_page_discloses_that_only_the_latest_feedback_was_read():
-    """The analysis reads exactly ONE feedback record, and the page has to say
-    so — otherwise a reader of a round-2 interview could reasonably assume the
-    analysis covered both rounds.
-
-    The disclosure is rendered by the page from the stored
-    ``analyzed_only_latest_feedback`` field. It is deliberately NOT expected to
-    come from the AI's prose: the prompt never asks for it, so relying on the
-    model to volunteer it would make the disclosure conditional on model
-    behaviour.
-    """
+def test_page_discloses_the_legacy_scope_of_an_earlier_analysis():
+    """Increment C reversed Step 9's "latest feedback only" decision, so this
+    test now pins the LEGACY wording: a row stamped
+    ``analyzed_only_latest_feedback = True`` read one record and no transcripts,
+    and the page must still say so, from the stored field and not from the AI's
+    prose. (The new-analysis disclosures are tested in
+    ``test_interviews_page_analysis_scope``.)"""
     at = _run(has_feedback=True, has_analysis=True)
     body = _text(at)
-    assert "Based on the most recent interview-feedback record only." in body
-    assert "regenerate to include it" in body
+    assert (
+        "This earlier analysis read only the most recent feedback record and "
+        "no transcripts." in body
+    )
+    assert "Based on interviewer feedback" not in body
 
 
 def test_the_disclosure_is_driven_by_the_stored_field():
@@ -298,7 +297,8 @@ def test_the_disclosure_is_driven_by_the_stored_field():
     which would make the test above pass while the field meant nothing."""
     at = _run(has_feedback=True, has_analysis=True, latest_only=False)
     body = _text(at)
-    # The analysis itself still renders — so the missing caption is a real
+    # The analysis itself still renders — so the missing legacy caption is a real
     # consequence of the field, not a page that failed to draw anything.
     assert "AI consolidated summary." in body
-    assert "most recent interview-feedback record only" not in body
+    assert "This earlier analysis read only" not in body
+    assert "No interview transcript was available when this analysis was" in body

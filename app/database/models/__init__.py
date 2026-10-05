@@ -22,6 +22,10 @@ from app.database.models.interview_feedback import (
     InterviewFeedback,
     InterviewFeedbackRating,
 )
+from app.database.models.interview_transcript import (
+    InterviewTranscript,
+    InterviewTranscriptStatus,
+)
 from app.database.models.interview_guide import (
     InterviewGuide,
     InterviewQuestion,
@@ -32,7 +36,9 @@ from app.database.models.job import Job, JdInputMethod, JobStatus
 from app.database.models.job_requirement import JobRequirement, RequirementType
 from app.database.models.post_interview_analysis import (
     PostInterviewAnalysis,
+    PostInterviewAnalysisFeedback,
     PostInterviewAnalysisStatus,
+    PostInterviewAnalysisTranscript,
 )
 from app.database.models.prequalification_result import PrequalificationResult
 from app.database.models.resume_extraction import ResumeExtraction
@@ -83,13 +89,17 @@ __all__ = [
     "InterviewGuide",
     "InterviewQuestion",
     "InterviewQuestionCategory",
+    "InterviewTranscript",
+    "InterviewTranscriptStatus",
     "Document",
     "JdInputMethod",
     "Job",
     "JobRequirement",
     "JobStatus",
     "PostInterviewAnalysis",
+    "PostInterviewAnalysisFeedback",
     "PostInterviewAnalysisStatus",
+    "PostInterviewAnalysisTranscript",
     "PrequalificationResult",
     "RequirementType",
     "ResumeExtraction",

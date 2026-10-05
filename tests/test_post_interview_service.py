@@ -95,6 +95,7 @@ def _conf(**over):
         has_substantive_notes=True,
         rating_count=1,
         unknown_count=0,
+        transcript_used=False,
     )
     kw.update(over)
     return compute_post_interview_confidence(**kw)
@@ -155,6 +156,7 @@ def test_confidence_rule_3_any_missing_piece_drops_below_high(over):
         has_substantive_notes=True,
         rating_count=1,
         unknown_count=0,
+        transcript_used=False,
     )
     kw.update(over)
     assert compute_post_interview_confidence(**kw) != "HIGH"
@@ -173,6 +175,7 @@ def test_confidence_is_always_one_of_the_three_values():
             has_substantive_notes=notes,
             rating_count=ratings,
             unknown_count=unknowns,
+            transcript_used=False,
         ) in {"HIGH", "MEDIUM", "LOW"}
 
 
@@ -244,6 +247,18 @@ def test_recommendation_never_returns_reject():
         )
         assert out != ScreeningRecommendation.REJECT
         assert out in ScreeningRecommendation.AUTOMATED
+
+
+def test_confidence_signature_is_the_old_one_plus_exactly_one_boolean():
+    """Increment C added ``transcript_used`` and nothing else — in particular no
+    human-recommendation parameter."""
+    import inspect
+
+    params = set(inspect.signature(compute_post_interview_confidence).parameters)
+    assert params == {
+        "screening_confidence", "has_substantive_notes", "rating_count",
+        "unknown_count", "transcript_used",
+    }
 
 
 def test_recommendation_does_not_read_the_human_recommendation():
@@ -463,7 +478,9 @@ def test_analysis_is_created_and_stored(db, mocker):
     assert out.status == PostInterviewAnalysisStatus.CURRENT
     assert out.superseded_at is None
     assert out.requested_by_user_id == s["hr"].id
-    assert out.analyzed_only_latest_feedback is True
+    # Increment C: new rows read every round, so this is False (it is True only
+    # on pre-Increment-C rows, which read one record and no transcripts).
+    assert out.analyzed_only_latest_feedback is False
     assert out.ai_model
 
 
@@ -481,7 +498,9 @@ def test_rubric_version_is_frozen_from_the_guide(db, mocker):
     assert out.interview_guide_id == s["guide"].id
 
 
-def test_only_the_latest_feedback_is_analysed(db, mocker):
+def test_the_anchor_and_snapshot_come_from_the_most_recent_record(db, mocker):
+    """Increment C reversed "latest only" for WHAT IS READ, but "most recent
+    record" keeps its Step 8 meaning for the anchor column and the snapshot."""
     s = _seed(db)
     earlier = _feedback(db, s, round_number=1, recommendation="HOLD")
     # Every row in this test shares one transaction, and Postgres ``now()`` is
@@ -498,7 +517,7 @@ def test_only_the_latest_feedback_is_analysed(db, mocker):
         db, user_id=s["hr"].id, application_id=s["app"].id
     )
     assert out.interview_feedback_id == latest.id
-    assert out.analyzed_only_latest_feedback is True
+    assert out.analyzed_only_latest_feedback is False
     assert out.human_recommendation_snapshot == "PROCEED"
 
 
@@ -727,7 +746,7 @@ def test_audit_event_carries_the_structural_facts(db, mocker):
     assert meta["strength_count"] == 2
     assert meta["gap_count"] == 0
     assert meta["unknown_count"] == 1
-    assert meta["analyzed_only_latest_feedback"] is True
+    assert meta["analyzed_only_latest_feedback"] is False
     assert meta["regenerated"] is False
 
 

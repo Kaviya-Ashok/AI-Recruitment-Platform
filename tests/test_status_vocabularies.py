@@ -303,3 +303,12 @@ def test_disagreement_event_type_exists_but_step_9_does_not_use_it():
         AuditEventType.AI_HUMAN_DISAGREEMENT_DETECTED.value
         == "AI_HUMAN_DISAGREEMENT_DETECTED"
     )
+
+
+def test_interview_transcript_uploaded_audit_member_exists():
+    """Increment B: one new member, string-valued, no migration needed (the
+    audit column is a String validated in the service layer)."""
+    assert (
+        AuditEventType.INTERVIEW_TRANSCRIPT_UPLOADED.value
+        == "INTERVIEW_TRANSCRIPT_UPLOADED"
+    )
