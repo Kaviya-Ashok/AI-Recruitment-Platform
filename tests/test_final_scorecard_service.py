@@ -43,7 +43,12 @@ from app.database.models.rubric import (
     RubricVersion,
     RubricVersionStatus,
 )
+from app.database.models.screening_answer import ScreeningAnswer
 from app.database.models.screening_evaluation import ScreeningEvaluation
+from app.database.models.screening_question import (
+    ScreeningQuestion,
+    ScreeningQuestionCategory,
+)
 from app.database.models.screening_session import (
     ScreeningSession,
     ScreeningSessionStatus,
@@ -174,12 +179,18 @@ def _rows(criteria, *, mandatory_result="PASS", other_result="PASS"):
 
 
 def _seed(db, *, with_feedback=True, with_analysis=True, with_ranking=True,
-          with_shortlist=True, with_guide=True, ratings=None,
-          human_recommendation="PROCEED", notes=_NOTES,
+          with_shortlist=True, with_guide=True, with_transcript=True,
+          ratings=None, human_recommendation="PROCEED", notes=_NOTES,
           mandatory_result="PASS", other_result="PASS",
           prequal_rubric=None):
     """A fully-evaluated application. Later stages are individually optional so
-    the missing-source tests can switch them off one at a time."""
+    the missing-source tests can switch them off one at a time.
+
+    ``with_transcript`` seeds two REAL ``screening_questions`` /
+    ``screening_answers`` rows (one answered, one not) — deliberately a
+    different count from ``len(_CRITERIA)`` (6), so a test asserting the
+    transcript count also proves it is no longer reading the criterion-row
+    count."""
     hr = _hr(db)
     job = create_job(
         db, title="Backend Engineer", department="Eng",
@@ -230,6 +241,19 @@ def _seed(db, *, with_feedback=True, with_analysis=True, with_ranking=True,
     )
     db.add(session)
     db.flush()
+
+    if with_transcript:
+        _add_transcript_entry(
+            db, session.id, sequence_index=0,
+            question_text="How long have you used Python?",
+            answer_text="About five years, mostly backend services.",
+        )
+        _add_transcript_entry(
+            db, session.id, sequence_index=1,
+            category=ScreeningQuestionCategory.GAP,
+            question_text="Can you describe your Kafka experience?",
+            answer_text=None,
+        )
 
     evaluation = ScreeningEvaluation(
         screening_session_id=session.id, rubric_version_id=rubric.id,
@@ -311,7 +335,34 @@ def _seed(db, *, with_feedback=True, with_analysis=True, with_ranking=True,
         "hr": hr, "job": job, "rubric": rubric, "criteria": criteria,
         "app": app, "guide": guide, "feedback": feedback,
         "analysis": analysis, "evaluation": evaluation, "entry": entry,
+        "session": session,
     }
+
+
+def _add_transcript_entry(
+    db, session_id, *, round_=1, sequence_index=0,
+    category=ScreeningQuestionCategory.JD, question_text="Q?",
+    answer_text="A.",
+):
+    """One real screening Q&A pair, via the actual
+    ``screening_questions`` / ``screening_answers`` tables — the only way
+    ``get_screening_transcript`` can ever return a non-empty result. Pass
+    ``answer_text=None`` for an unanswered question."""
+    q = ScreeningQuestion(
+        screening_session_id=session_id, round=round_,
+        sequence_index=sequence_index, category=category,
+        rubric_criterion_id=None, question_text=question_text,
+        generated_reason="probes a gap", ai_model="claude-sonnet-5",
+    )
+    db.add(q)
+    db.flush()
+    if answer_text is not None:
+        db.add(ScreeningAnswer(
+            screening_question_id=q.id, answer_text=answer_text,
+            submitted_at=datetime.now(timezone.utc),
+        ))
+        db.flush()
+    return q
 
 
 def _card(db, s, user=None):
@@ -332,7 +383,8 @@ def test_assembles_every_evidence_source(db):
     assert v.resume_evidence["skills"] == ["Python", "Spark"]  # 2 résumé
     assert v.mandatory_criteria                            # 3/4 prequal+screening
     assert v.requirements.score == 8                       # 4 screening eval
-    assert v.screening_question_count == len(_CRITERIA)    # 5 transcript-derived
+    assert v.has_screening_transcript is True               # 5 real transcript
+    assert v.screening_question_count == 2                  # (seeded by _seed)
     assert v.ranking.rank_position == 2                    # 6 ranking
     assert v.ranking.is_shortlisted is True                # 7 shortlist
     assert v.interview_guide_question_count is not None    # 8 guide
@@ -392,6 +444,91 @@ def test_uses_only_the_current_post_interview_analysis(db):
 
 
 # --- provenance ---------------------------------------------------
+
+
+# --- screening transcript (wired to the real accessor) -----------
+
+
+def test_transcript_absent_even_with_an_evaluation_present(db):
+    """Proves the old ``evaluation is not None`` proxy is gone: a screening
+    evaluation exists here, but zero real transcript rows do, so the field
+    must now be False/0 rather than True (as the old proxy would report)."""
+    s = _seed(db, with_transcript=False)
+    v = _card(db, s)
+
+    assert s["evaluation"] is not None               # evaluation DOES exist
+    assert v.has_screening_transcript is False
+    assert v.screening_question_count == 0
+    assert v.screening_transcript == ()
+
+
+def test_transcript_count_reflects_real_entries_not_criterion_rows(db):
+    """The seeded transcript (2 entries) and the rubric criteria (6, via
+    ``_CRITERIA``) are deliberately different counts — this proves the field
+    now reads the real transcript, not ``len(criterion_rows)``."""
+    s = _seed(db)
+    v = _card(db, s)
+
+    assert len(_CRITERIA) == 6                 # the old (wrong) source value
+    assert v.screening_question_count == 2     # the real transcript count
+    assert v.screening_question_count != len(_CRITERIA)
+    assert v.has_screening_transcript is True
+
+
+def test_transcript_entries_carry_real_question_and_answer_content(db):
+    """Not fabricated or placeholder text — the actual seeded Q&A, verbatim,
+    via the real ``get_screening_transcript`` accessor."""
+    s = _seed(db)
+    v = _card(db, s)
+
+    texts = {e.question_text: e.answer_text for e in v.screening_transcript}
+    assert texts["How long have you used Python?"] == (
+        "About five years, mostly backend services."
+    )
+    assert texts["Can you describe your Kafka experience?"] is None
+    answered_flags = {e.question_text: e.answered for e in v.screening_transcript}
+    assert answered_flags["How long have you used Python?"] is True
+    assert answered_flags["Can you describe your Kafka experience?"] is False
+
+
+def test_transcript_entries_are_frozen_and_session_safe(db):
+    s = _seed(db)
+    v = _card(db, s)
+    db.expunge_all()
+    assert len(v.screening_transcript) == 2
+    entry = v.screening_transcript[0]
+    assert entry.question_text and entry.round == 1
+    with pytest.raises(Exception):
+        entry.answer_text = "mutated"
+
+
+def test_other_evidence_sources_unaffected_by_transcript_fix(db):
+    """Regression guard: every OTHER field on the view is unchanged in shape
+    and content now that the transcript fields read real data. Mirrors the
+    original assertions in ``test_assembles_every_evidence_source`` for the
+    sources this fix did not touch."""
+    s = _seed(db)
+    v = _card(db, s)
+
+    assert v.candidate_name == "Casey Candidate"
+    assert v.resume_evidence["skills"] == ["Python", "Spark"]
+    assert len(v.mandatory_criteria) == 2
+    assert len(v.preferred_criteria) == 1
+    assert v.requirements.score == 8
+    assert v.experience.score == 7
+    assert v.behavioral.score == 6
+    assert v.ranking.rank_position == 2
+    assert v.ranking.is_shortlisted is True
+    assert v.interview_guide_question_count is not None
+    assert v.interview_round == 1
+    assert v.post_interview_summary == "AI consolidated summary."
+    assert v.screening_ai_recommendation == "PROCEED"
+    assert v.post_interview_ai_recommendation == "PROCEED"
+    assert v.human_recommendation == "PROCEED"
+    assert v.disagreement_status == DISAGREEMENT_NOT_ASSESSED
+    assert v.final_decision_status == FINAL_DECISION_NOT_DECIDED
+    assert v.has_multiple_rubric_versions is False
+    assert v.missing_sources == ()
 
 
 def test_every_displayed_group_carries_provenance(db):

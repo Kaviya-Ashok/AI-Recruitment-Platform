@@ -43,6 +43,14 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Same pattern as app/services/storage_service.py, but this file lives in
+# scripts/ (one level below the repo root, not two), so parents[1].
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_REPO_ROOT / ".env")
 
 # Full drive scope is required (not drive.file): the Drive root folder was
 # created in the Drive UI, not by this app, and this headless flow has no Google

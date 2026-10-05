@@ -838,6 +838,25 @@ def _render_final_scorecard(view) -> None:
     else:
         st.caption("No résumé evidence has been extracted for this candidate.")
 
+    st.caption(f"Source: {Provenance.SCREENING_TRANSCRIPT}")
+    if view.has_screening_transcript:
+        _n = view.screening_question_count
+        with st.expander(
+            f"Screening transcript ({_n} question{'s' if _n != 1 else ''})",
+            expanded=False,
+        ):
+            for entry in view.screening_transcript:
+                st.markdown(
+                    f"**Round {entry.round} · {label_for(entry.category)}**"
+                )
+                st.markdown(entry.question_text)
+                if entry.answered:
+                    st.markdown(f"> {entry.answer_text}")
+                else:
+                    st.caption("(not answered)")
+    else:
+        st.caption("No screening transcript is available for this candidate yet.")
+
     # --- AI ASSESSMENT ----------------------------------------------
     st.divider()
     st.markdown("### AI assessment")

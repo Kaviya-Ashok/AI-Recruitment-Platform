@@ -115,6 +115,15 @@ class _Rating:
 
 
 @dataclass(frozen=True)
+class _TranscriptEntry:
+    round: int
+    category: str
+    question_text: str
+    answer_text: str | None
+    answered: bool
+
+
+@dataclass(frozen=True)
 class _Ranking:
     rank_position: int | None = 2
     overall_score: float | None = 7.25
@@ -159,7 +168,8 @@ class _Card:
     post_interview_evidence_consistency: str | None = "Sources line up."
     resume_evidence: dict = None            # type: ignore[assignment]
     has_screening_transcript: bool = True
-    screening_question_count: int = 6
+    screening_question_count: int = 2
+    screening_transcript: tuple = ()
     interview_guide_question_count: int | None = 8
     interview_round: int | None = 1
     interview_notes: str | None = "Interviewer's own words."
@@ -198,6 +208,12 @@ def _card(**over):
         ),
         resume_evidence={"skills": ["Python", "Spark"]},
         interview_ratings=(_Rating("System design", 4, 5, "Clear."),),
+        screening_transcript=(
+            _TranscriptEntry(1, "JD", "How long have you used Python?",
+                              "About five years.", True),
+            _TranscriptEntry(1, "GAP", "Describe your Kafka experience.",
+                              None, False),
+        ),
         ranking=_Ranking(),
     )
     kw.update(over)
@@ -397,6 +413,41 @@ def test_missing_sources_are_listed_not_hidden():
     body = _text(at)
     assert "Not yet available" in body
     assert "Human interview feedback" in body
+
+
+# --- screening transcript (wired to the real accessor) -----------
+
+
+def test_transcript_preview_renders_real_qa_content():
+    """Real question/answer text from the fixture's transcript entries, not
+    fabricated or placeholder text — the default fixture already seeds two
+    real entries (one answered, one not)."""
+    at = _run(open_panel=True)
+    body = _text(at)
+    assert "How long have you used Python?" in body
+    assert "About five years." in body
+    assert "Describe your Kafka experience." in body
+    assert "(not answered)" in body
+
+
+def test_transcript_count_appears_in_the_expander_label():
+    at = _run(open_panel=True)
+    labels = [e.label for e in at.expander]
+    assert any("Screening transcript (2 question" in label for label in labels)
+
+
+def test_no_transcript_shows_an_honest_unavailable_message():
+    at = _run(
+        open_panel=True,
+        card_kwargs=(
+            "has_screening_transcript=False, screening_question_count=0, "
+            "screening_transcript=()"
+        ),
+    )
+    body = _text(at)
+    assert "No screening transcript is available for this candidate yet." in body
+    labels = [e.label for e in at.expander]
+    assert not any("Screening transcript" in label for label in labels)
 
 
 # --- no raw HTML / CSS -----------------------------------------------

@@ -103,6 +103,10 @@ from app.services.resume_parsing_service import get_extraction_for_document
 from app.services.screening_evaluation_service import (
     get_screening_evaluation_for_application,
 )
+from app.services.screening_pipeline_service import (
+    get_screening_session_for_application,
+)
+from app.services.screening_question_service import get_screening_transcript
 from app.services.shortlist_service import get_shortlist_entry_for_application
 from app.services.storage_service import list_documents_for_application
 from app.utils.authorization import require_internal_user
@@ -250,6 +254,23 @@ class ScorecardRating:
 
 
 @dataclass(frozen=True)
+class ScorecardTranscriptEntry:
+    """One screening Q&A pair, read from the real transcript accessor.
+
+    Mirrors the subset of ``ScreeningTranscriptItem`` relevant to a hiring
+    manager reading this scorecard — not the full ORM-field set that accessor
+    exposes (``rubric_criterion_id`` / ``generated_reason`` / ``ai_model`` are
+    HR-authoring context, not scorecard content).
+    """
+
+    round: int
+    category: str
+    question_text: str
+    answer_text: str | None
+    answered: bool
+
+
+@dataclass(frozen=True)
 class ScorecardRanking:
     """Step 5's ranking, read as recorded. Never recalculated here."""
 
@@ -316,6 +337,7 @@ class FinalScorecardView:
     resume_evidence: dict
     has_screening_transcript: bool
     screening_question_count: int
+    screening_transcript: tuple[ScorecardTranscriptEntry, ...]
 
     # --- interview ---
     interview_guide_question_count: int | None
@@ -542,6 +564,23 @@ def get_final_scorecard(
     if evaluation is None:
         missing.append("Screening evaluation")
 
+    # Fetched independently of ``evaluation`` — a screening session (and a real
+    # transcript) can exist before the automatic evaluation has run, since the
+    # §2A pipeline's evaluation trigger is best-effort and separately
+    # recoverable. Coupling transcript presence to evaluation presence (the
+    # prior behaviour) silently misreported that state.
+    screening_session = get_screening_session_for_application(
+        db, app_uuid, acting_user_id=acting_user_id
+    )
+    transcript_items = (
+        get_screening_transcript(
+            db, screening_session_id=screening_session.id,
+            acting_user_id=acting_user_id,
+        )
+        if screening_session is not None
+        else []
+    )
+
     guide = get_interview_guide_for_application(
         db, app_uuid, acting_user_id=acting_user_id
     )
@@ -755,8 +794,18 @@ def get_final_scorecard(
             analysis, "evidence_consistency_notes", None
         ),
         resume_evidence=resume_evidence,
-        has_screening_transcript=evaluation is not None,
-        screening_question_count=len(criterion_rows),
+        has_screening_transcript=bool(transcript_items),
+        screening_question_count=len(transcript_items),
+        screening_transcript=tuple(
+            ScorecardTranscriptEntry(
+                round=item.round,
+                category=item.category,
+                question_text=item.question_text,
+                answer_text=item.answer_text,
+                answered=item.answered,
+            )
+            for item in transcript_items
+        ),
         interview_guide_question_count=(
             len(guide.questions) if guide is not None else None
         ),
