@@ -68,6 +68,8 @@ class AuditEventType(str, enum.Enum):
 
     # Account / user lifecycle (security-relevant, CLAUDE.md §§16, 20, 23).
     USER_CREATED = "USER_CREATED"
+    USER_DEACTIVATED = "USER_DEACTIVATED"
+    USER_REACTIVATED = "USER_REACTIVATED"
 
     JOB_CREATED = "JOB_CREATED"
     JOB_OPENED = "JOB_OPENED"

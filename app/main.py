@@ -38,9 +38,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database.database import session_scope
 from app.database.models.application import ApplicationStatus
 from app.database.models.job import JobStatus
+from app.database.models.user import UserRole
 from app.pages.candidates import render_candidates_page
 from app.pages.interviews import render_interviews_page
 from app.pages.jobs import render_jobs_page
+from app.pages.users import render_users_page
 from app.services.application_service import list_applications_for_job
 from app.services.auth_service import authenticate_user
 from app.services.job_service import list_jobs
@@ -274,6 +276,25 @@ _PAGES: dict[str, st.Page] = {
 }
 
 
+#: The Users page is NOT in ``_PAGES``: it is registered for ADMIN only, so every
+#: other role's navigation simply does not contain it (and ``/users`` falls back to
+#: the default page for them). The service functions refuse non-admins as well.
+_USERS_PAGE = st.Page(
+    render_users_page,
+    title="Users",
+    icon=":material/manage_accounts:",
+    url_path="users",
+)
+
+
+def _pages_for_current_user() -> list[st.Page]:
+    pages = list(_PAGES.values())
+    current = get_current_user(st.session_state) or {}
+    if current.get("role") == UserRole.ADMIN.value:
+        pages.append(_USERS_PAGE)
+    return pages
+
+
 def main() -> None:
     # Once per run, BEFORE either branch, so the login screen and every
     # authenticated page get the one static stylesheet (app/ui/theme.py).
@@ -283,7 +304,7 @@ def main() -> None:
         return
 
     _render_account_sidebar()
-    st.navigation(list(_PAGES.values()), position="sidebar").run()
+    st.navigation(_pages_for_current_user(), position="sidebar").run()
 
 
 main()
