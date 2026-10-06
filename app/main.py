@@ -55,10 +55,11 @@ from app.utils.session import (
 from app.ui.theme import inject_theme
 from app.utils.ui import label_for
 from app.utils.ui_widgets import page_header
+from app.utils.workspace_nav import deep_link_target
 
 st.set_page_config(
     page_title="Recruitment Intelligence Platform",
-    page_icon="🧭",
+    page_icon=":material/hub:",
     # HR app only. The Jobs/Candidates pages are dense, multi-column, tabular
     # views that were cramped in the default ~730px "centered" column (audit
     # H14). The public candidate app (app/public_main.py) deliberately stays
@@ -185,6 +186,17 @@ def _gather_landing_data(acting_user_id: uuid.UUID) -> dict:
 
 
 def _dashboard_page() -> None:
+    # A workspace link (``/?job=..&stage=..``) lands here after sign-in or a
+    # refresh, because the logged-out redirect drops the Jobs page's path. Hand it
+    # on to the Jobs page, which shows the workspace. This runs ONLY on the
+    # Dashboard — the Jobs page never redirects — and ``switch_page`` replaces the
+    # query string, so the parameters are consumed and cannot loop. A malformed
+    # ``job`` is ignored and the Dashboard renders normally. Nothing is logged.
+    # (Back/Forward limitation: see app/utils/workspace_nav.py.)
+    target = deep_link_target()
+    if target is not None:
+        st.switch_page(_PAGES["jobs"], query_params=target)
+
     current = get_current_user(st.session_state)
     page_header(
         "Dashboard",
@@ -207,7 +219,7 @@ def _dashboard_page() -> None:
 
     if not data["has_jobs"]:
         st.info("No jobs yet. Create your first job on the **Jobs** page.")
-        st.page_link(_PAGES["jobs"], label="Go to Jobs", icon="📋")
+        st.page_link(_PAGES["jobs"], label="Go to Jobs", icon=":material/work:")
         return
 
     cols = st.columns(3)
@@ -242,14 +254,22 @@ def _render_account_sidebar() -> None:
 
 _PAGES: dict[str, st.Page] = {
     "dashboard": st.Page(
-        _dashboard_page, title="Dashboard", icon="🏠", default=True
+        _dashboard_page, title="Dashboard", icon=":material/dashboard:", default=True
     ),
-    "jobs": st.Page(render_jobs_page, title="Jobs", icon="📋", url_path="jobs"),
+    "jobs": st.Page(
+        render_jobs_page, title="Jobs", icon=":material/work:", url_path="jobs"
+    ),
     "candidates": st.Page(
-        render_candidates_page, title="Candidates", icon="👤", url_path="candidates"
+        render_candidates_page,
+        title="Candidates",
+        icon=":material/group:",
+        url_path="candidates",
     ),
     "interviews": st.Page(
-        render_interviews_page, title="Interviews", icon="📝", url_path="interviews"
+        render_interviews_page,
+        title="Interviews",
+        icon=":material/forum:",
+        url_path="interviews",
     ),
 }
 

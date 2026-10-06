@@ -57,6 +57,7 @@ from app.utils.ui_widgets import (
     success_toast,
 )
 from app.utils.validation import FileValidationError
+from app.utils.workspace_nav import open_workspace, requested_job
 
 _PASTE = "Paste text"
 _UPLOAD = "Upload file"
@@ -657,7 +658,24 @@ def _render_job_card(
     That is what actually bounds this page's cost, not the visual collapse.
     """
     job_id = job_view["id"]
-    analyzed = job_view["status"] != JobStatus.DRAFT
+
+    # Increment 2: one click into the job's workspace. The title is a button too
+    # (a card header cannot hold one), so either opens it.
+    open_row = st.columns([5, 2], vertical_alignment="center")
+    open_row[0].button(
+        job_view["title"],
+        key=f"ws_title_{job_id}",
+        type="tertiary",
+        on_click=open_workspace,
+        args=(str(job_id),),
+    )
+    open_row[1].button(
+        "Open workspace",
+        key=f"ws_open_{job_id}",
+        type="primary",
+        on_click=open_workspace,
+        args=(str(job_id),),
+    )
 
     card = st.expander(
         _card_label(job_view),
@@ -669,25 +687,36 @@ def _render_job_card(
         return
 
     with card:
-        st.caption(f"Job code: {job_view['job_code']}")
-        label = "Re-analyze JD" if analyzed else "Analyze JD"
-        clicked = st.button(
-            label,
-            key=f"analyze_{job_id}",
-            disabled=not job_view["has_jd"],
-            help=None if job_view["has_jd"] else "This job has no JD text.",
-        )
-        if clicked:
-            _run_analysis(job_id, requested_by_user_id)
+        _render_job_body(job_view, requested_by_user_id)
 
-        if analyzed:
-            _render_requirements(job_id)
-            st.divider()
-            _render_rubric_section(job_id, requested_by_user_id)
 
-        if job_view["status"] in _LINK_STATUSES:
-            st.divider()
-            _render_link_section(job_id, job_view["status"], requested_by_user_id)
+def _render_job_body(job_view: dict, requested_by_user_id) -> None:
+    """The content of one job: code, JD analysis, requirements, rubric and the
+    application link. Shared by the collapsible card below and by the job
+    workspace's Setup stage (Increment 2) — extracted, not rewritten: the code is
+    the card's old body verbatim, and ``job_view`` is the same dict."""
+    job_id = job_view["id"]
+    analyzed = job_view["status"] != JobStatus.DRAFT
+
+    st.caption(f"Job code: {job_view['job_code']}")
+    label = "Re-analyze JD" if analyzed else "Analyze JD"
+    clicked = st.button(
+        label,
+        key=f"analyze_{job_id}",
+        disabled=not job_view["has_jd"],
+        help=None if job_view["has_jd"] else "This job has no JD text.",
+    )
+    if clicked:
+        _run_analysis(job_id, requested_by_user_id)
+
+    if analyzed:
+        _render_requirements(job_id)
+        st.divider()
+        _render_rubric_section(job_id, requested_by_user_id)
+
+    if job_view["status"] in _LINK_STATUSES:
+        st.divider()
+        _render_link_section(job_id, job_view["status"], requested_by_user_id)
 
 
 def _job_view(job) -> dict:
@@ -819,6 +848,15 @@ def render_jobs_page() -> None:
         created_by_user_id = uuid.UUID(current["id"])
     except (ValueError, KeyError, TypeError):
         created_by_user_id = None
+
+    # A ``?job=`` query parameter means "show this job's workspace instead of
+    # the list". Imported here, not at module level: the workspace imports this
+    # module's section renderers, so a top-level import would be circular.
+    if requested_job() is not None:
+        from app.pages.job_workspace import render_job_workspace
+
+        render_job_workspace(created_by_user_id)
+        return
 
     page_header("Jobs")
     _render_create_form(created_by_user_id)

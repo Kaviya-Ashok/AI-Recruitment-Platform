@@ -395,3 +395,30 @@ def ai_provenance(when: datetime | str | None = None) -> str:
         return f"AI-generated · {moment:%Y-%m-%d}"
     except (AttributeError, ValueError):
         return "AI-generated"
+
+
+def stage_label(
+    number: int,
+    name: str,
+    *,
+    count_text: str | None = None,
+    complete: bool = False,
+    attention: int = 0,
+) -> str:
+    """The text of one job-workspace stage option, e.g.
+    ``"2. Applicants · 5 · 1 to review"`` or ``"✓ 1. Setup · v2"``.
+
+    Plain text only — no markup, no HTML, no emoji: the optional tick is the plain
+    text mark ``✓`` (U+2713), shown BEFORE the number when the stage is complete,
+    so completion is stated in a character, never by colour alone. ``count_text`` is
+    what the caller wants shown after the name (already formatted: ``"5"``,
+    ``"v2"``, ``"1 of 3 decided"``); ``attention`` adds ``"N to review"`` only when
+    it is positive. Pure.
+    """
+    parts = [f"{number}. {name}"]
+    if count_text:
+        parts.append(count_text)
+    if attention and attention > 0:
+        parts.append(f"{attention} to review")
+    label = " · ".join(parts)
+    return f"✓ {label}" if complete else label
