@@ -40,6 +40,7 @@ _PATCHED_ATTRS = (
     "create_post_interview_analysis",
     "_render_feedback_section",
     "_render_final_ranking_section",
+    "_render_final_decision_section",
     "_render_shortlisted_section",
 )
 
@@ -154,6 +155,8 @@ I._render_feedback_section = lambda *a, **k: None
 # Step 10b's per-job final-ranking section is not under test here (and would hit
 # the database); stubbed like the other sections.
 I._render_final_ranking_section = lambda *a, **k: None
+# Step 11's per-candidate decision section is not under test here either.
+I._render_final_decision_section = lambda *a, **k: None
 
 
 def fake_create(*a, **k):

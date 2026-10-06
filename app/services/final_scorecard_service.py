@@ -32,9 +32,11 @@ WHAT THIS MODULE DOES *NOT* DO
   recommendations are carried side by side and never compared, subtracted,
   ranked, or reduced to a verdict. ``AI_HUMAN_DISAGREEMENT_DETECTED`` stays
   declared-but-unemitted. :data:`DISAGREEMENT_NOT_ASSESSED` is a fixed string.
-* **No final human decision** (CLAUDE.md §11 — Step 11, not built).
-  :data:`FINAL_DECISION_NOT_DECIDED` is a fixed string. Nothing here infers,
-  proposes, or records a decision.
+* **No inferring or recording of the final human decision** (CLAUDE.md §11).
+  Since Step 11 the scorecard READS the CURRENT decision through
+  ``final_decision_service`` (who and when, never the rationale) and shows it;
+  when none exists :data:`FINAL_DECISION_NOT_DECIDED` ("Not decided yet") stays.
+  Nothing here infers, proposes, or records a decision.
 * **No new ranking.** Step 5's ranking is displayed as recorded. Nothing is
   re-ranked using interview or post-interview evidence, and no second
   post-interview ranking is produced.
@@ -91,6 +93,7 @@ from app.database.models.job import Job
 from app.database.models.job_requirement import RequirementType
 from app.database.models.rubric import RubricVersion
 from app.database.models.user import SYSTEM_USER_ID, User, UserRole
+from app.services.final_decision_service import get_current_final_decision
 from app.services.final_ranking_service import get_final_ranking_for_application
 from app.services.final_scoring import (
     compute_interview_score_all_rounds,
@@ -320,6 +323,17 @@ class ScorecardFinalRanking:
 
 
 @dataclass(frozen=True)
+class ScorecardFinalDecision:
+    """The CURRENT final human decision, as a reader needs it on the scorecard.
+    The rationale is deliberately NOT carried here — it is shown in the decision
+    section, not on the scorecard."""
+
+    decision: str
+    decided_by_name: str
+    decided_at: datetime
+
+
+@dataclass(frozen=True)
 class FinalScorecardView:
     """The whole §10 scorecard for one application. Frozen primitives and
     frozen children only, so a Streamlit page can build this inside a
@@ -420,6 +434,9 @@ class FinalScorecardView:
     # This candidate's entry in the latest CURRENT final ranking, read-only; None
     # when no final ranking has been generated for them yet.
     final_ranking: "ScorecardFinalRanking | None" = None
+
+    # --- Step 11: the CURRENT final human decision (None until one is recorded) ---
+    final_decision: "ScorecardFinalDecision | None" = None
 
 
 # --- the one score this module derives (CLAUDE.md §§10, 20) -----------
@@ -803,6 +820,10 @@ def get_final_scorecard(
     final_entry = get_final_ranking_for_application(
         db, app_uuid, acting_user_id=acting_user_id
     )
+    # Read-only: the decision is recorded elsewhere, by a hiring manager / admin.
+    recorded_decision = get_current_final_decision(
+        db, app_uuid, acting_user_id=acting_user_id
+    )
 
     overall_unavailable = (
         None if ranking.overall_score is not None
@@ -871,7 +892,12 @@ def get_final_scorecard(
         # The interviewer's own value, unmodified and un-normalised.
         human_recommendation=getattr(latest_feedback, "recommendation", None),
         disagreement_status=DISAGREEMENT_NOT_ASSESSED,
-        final_decision_status=FINAL_DECISION_NOT_DECIDED,
+        # The decision value once one is recorded; the fixed placeholder until then.
+        final_decision_status=(
+            recorded_decision.decision
+            if recorded_decision is not None
+            else FINAL_DECISION_NOT_DECIDED
+        ),
         ranking=ranking,
         missing_sources=tuple(missing),
         interview_transcript_file_name=(
@@ -887,6 +913,14 @@ def get_final_scorecard(
         ),
         post_interview_read_latest_only=bool(
             getattr(analysis, "analyzed_only_latest_feedback", False)
+        ),
+        final_decision=(
+            ScorecardFinalDecision(
+                decision=recorded_decision.decision,
+                decided_by_name=recorded_decision.decided_by_name,
+                decided_at=recorded_decision.created_at,
+            )
+            if recorded_decision is not None else None
         ),
         interview_rounds_used=tuple(sorted(round_means)),
         interview_rounds_unscored=rounds_unscored,

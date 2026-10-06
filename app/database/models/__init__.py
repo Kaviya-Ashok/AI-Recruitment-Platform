@@ -15,6 +15,10 @@ from app.database.models.audit_event import AuditEvent, AuditEventType
 from app.database.models.candidate import Candidate
 from app.database.models.candidate_ranking import CandidateRanking
 from app.database.models.candidate_shortlist_entry import CandidateShortlistEntry
+from app.database.models.final_decision import (
+    FinalDecision,
+    FinalDecisionStatus,
+)
 from app.database.models.final_ranking import (
     FinalRanking,
     FinalRankingEntry,
@@ -90,6 +94,8 @@ __all__ = [
     "Candidate",
     "CandidateRanking",
     "CandidateShortlistEntry",
+    "FinalDecision",
+    "FinalDecisionStatus",
     "FinalRanking",
     "FinalRankingEntry",
     "FinalRankingEntryStatus",

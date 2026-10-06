@@ -32,6 +32,12 @@ Scope (deliberately minimal)
   equal), with the breakdown, caveats, ties, the ineligible and incomplete lists,
   a stale banner and earlier runs. No AI is involved and nothing is rejected.
 
+* Step 11: under each candidate's final scorecard, a "Final human decision"
+  section — the hiring manager's PROCEED / HOLD / REJECT with a required
+  rationale. Only a hiring manager or an admin can record one (the service
+  enforces it; the page merely hides the form from others). Recording is all it
+  does: no status change, no notification. No AI is involved.
+
 Rendered via ``st.navigation`` from ``app/main.py`` (never auto-discovered).
 100% HR-only — no candidate-facing surface is touched. Business logic lives in
 ``interview_guide_service``; this file is thin glue.
@@ -49,6 +55,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.database import session_scope
 from app.database.models.interview_feedback import RATING_MAX, RATING_MIN
+from app.database.models.final_decision import FinalDecisionStatus
 from app.database.models.final_ranking import FinalRankingEntryStatus
 from app.database.models.interview_guide import InterviewQuestionCategory
 from app.database.models.interview_transcript import InterviewTranscriptStatus
@@ -56,6 +63,17 @@ from app.database.models.post_interview_analysis import (
     PostInterviewAnalysisStatus,
 )
 from app.database.models.screening_evaluation import ScreeningRecommendation
+from app.services.final_decision_service import (
+    RATIONALE_MAX_CHARS,
+    RATIONALE_MIN_CHARS,
+    FinalDecisionError,
+    get_current_final_decision,
+    get_final_decision_staleness,
+    list_current_decisions_for_job,
+    list_final_decision_history,
+    record_final_decision,
+    role_may_decide,
+)
 from app.services.final_ranking_service import (
     FinalRankingError,
     generate_final_ranking,
@@ -108,6 +126,7 @@ from app.utils.ui import (
 )
 from app.utils.ui_widgets import (
     HR_JOB_PICKER_KEY,
+    confirmed,
     detail_lines,
     job_picker,
     load_error,
@@ -131,6 +150,25 @@ _TRANSCRIPT_UPLOAD_LABEL = "Interview transcript (PDF or DOCX, up to 10 MB)"
 _TRANSCRIPT_NOT_EXTRACTABLE = (
     "This file has no readable text (it is probably a scan). It can be "
     "stored, but an AI analysis will not be able to use it."
+)
+_DECISION_DB_ERROR = "Couldn't save the final decision — please try again."
+_DECISION_UNEXPECTED = (
+    "Something went wrong recording the final decision. Please try again."
+)
+_DECISION_CHOOSE = "Choose Proceed, Hold or Reject."
+_DECISION_CONFIRM_FIRST = (
+    "Please confirm that you have reviewed the scorecard, interview feedback "
+    "and analysis before recording the decision."
+)
+_DECISION_RECORDED_ONLY = (
+    "Recorded only. This does not notify the candidate or change any status."
+)
+_DECISION_EVIDENCE_ONLY = "Base the decision on job-relevant evidence only."
+_DECISION_STALE = "Based on earlier evidence — "
+_DECISION_ORDER = (
+    ScreeningRecommendation.PROCEED,
+    ScreeningRecommendation.HOLD,
+    ScreeningRecommendation.REJECT,
 )
 _FINAL_RANK_DB_ERROR = "Couldn't save the final ranking — please try again."
 _FINAL_RANK_UNEXPECTED = (
@@ -217,12 +255,29 @@ def _load_view(job_id: str, acting_user_id) -> dict:
             }
             for app_id in application_ids
         }
+        # Step 11: the final human decision, its history and whether it rests on
+        # earlier evidence. Plain SELECTs — nothing is written on page load.
+        decisions = {
+            app_id: {
+                "current": get_current_final_decision(
+                    db, app_id, acting_user_id=acting_user_id
+                ),
+                "history": list_final_decision_history(
+                    db, app_id, acting_user_id=acting_user_id
+                ),
+                "staleness": get_final_decision_staleness(
+                    db, app_id, acting_user_id=acting_user_id
+                ),
+            }
+            for app_id in application_ids
+        }
         # primitives / frozen dataclasses only — safe outside the session
         return {
             "shortlisted": shortlisted,
             "guides_by_application": {g.application_id: g for g in guides},
             "feedback_by_application": feedback,
             "analysis_by_application": analyses,
+            "decision_by_application": decisions,
         }
 
 
@@ -846,6 +901,10 @@ def _load_final_ranking_view(job_id: str, acting_user_id) -> dict:
             "staleness": get_final_ranking_staleness(
                 db, job_id=job_id, acting_user_id=acting_user_id
             ),
+            # Step 11: read-only "Decision: …" line on each row.
+            "decisions": list_current_decisions_for_job(
+                db, job_id, acting_user_id=acting_user_id
+            ),
         }
 
 
@@ -933,7 +992,17 @@ def _render_final_entry_context(entry) -> None:
         )
 
 
-def _render_final_ranked_row(entry, run) -> None:
+def _decision_line(decision) -> str:
+    """A small read-only line for a final-ranking row."""
+    if decision is None:
+        return "Decision: No final decision yet"
+    return (
+        f"Decision: {label_for(decision.decision)} "
+        f"({decision.decided_by_name}, {decision.created_at:%Y-%m-%d})"
+    )
+
+
+def _render_final_ranked_row(entry, run, decision=None) -> None:
     tie = (
         "  " + entity_badge("ranking", "caution", "Tied — shares this rank")
         if entry.tied else ""
@@ -954,10 +1023,11 @@ def _render_final_ranked_row(entry, run) -> None:
     _render_final_entry_context(entry)
     if entry.status_reason:
         st.caption(entry.status_reason)
+    st.caption(_decision_line(decision))
     st.divider()
 
 
-def _render_final_unranked_row(entry, run) -> None:
+def _render_final_unranked_row(entry, run, decision=None) -> None:
     ineligible = entry.entry_status == FinalRankingEntryStatus.NOT_RANKED_INELIGIBLE
     label = (
         "Not ranked — mandatory requirement not met" if ineligible
@@ -977,6 +1047,7 @@ def _render_final_unranked_row(entry, run) -> None:
     if entry.final_score is not None:
         _render_final_entry_context(entry)
     st.caption(entry.status_reason)
+    st.caption(_decision_line(decision))
     st.divider()
 
 
@@ -1000,6 +1071,7 @@ def _render_final_ranking_section(job_id: str, acting_user_id) -> None:
         return
 
     current = view["current"]
+    decisions = view.get("decisions") or {}
     if st.button(
         "Regenerate final ranking" if current else "Generate final ranking",
         key=f"final_rank_{job_id}",
@@ -1057,7 +1129,7 @@ def _render_final_ranking_section(job_id: str, acting_user_id) -> None:
         if not ranked:
             st.caption("No candidate in this group could be ranked.")
         for e in ranked:
-            _render_final_ranked_row(e, run)
+            _render_final_ranked_row(e, run, decisions.get(e.application_id))
         if ineligible:
             st.markdown(f"##### Not ranked — ineligible ({len(ineligible)})")
             st.caption(
@@ -1066,7 +1138,7 @@ def _render_final_ranking_section(job_id: str, acting_user_id) -> None:
                 "that remains a human decision."
             )
             for e in ineligible:
-                _render_final_unranked_row(e, run)
+                _render_final_unranked_row(e, run, decisions.get(e.application_id))
         if incomplete:
             st.markdown(f"##### Incomplete ({len(incomplete)})")
             st.caption(
@@ -1074,7 +1146,7 @@ def _render_final_ranking_section(job_id: str, acting_user_id) -> None:
                 "and the weights are never redistributed."
             )
             for e in incomplete:
-                _render_final_unranked_row(e, run)
+                _render_final_unranked_row(e, run, decisions.get(e.application_id))
 
     earlier = [h for h in view["history"] if h.status != "CURRENT"]
     if earlier:
@@ -1725,11 +1797,26 @@ def _render_final_scorecard(view) -> None:
     # --- FINAL DECISION ---------------------------------------------
     st.divider()
     st.markdown("### Final human decision")
-    st.markdown(f"**{view.final_decision_status}**")
-    st.caption(
-        "The hiring manager's decision is recorded in a later step. Nothing on "
-        "this page makes, proposes, or infers it."
-    )
+    recorded = getattr(view, "final_decision", None)
+    if recorded is not None:
+        st.markdown(
+            badge(
+                recommendation_kind(recorded.decision),
+                f"Final decision: {label_for(recorded.decision)}",
+            )
+        )
+        st.caption(
+            f"Recorded by {recorded.decided_by_name} on "
+            f"{recorded.decided_at:%Y-%m-%d}. The rationale is in this "
+            "candidate's Final human decision section. Recorded only — nothing "
+            "else was changed."
+        )
+    else:
+        st.markdown(f"**{view.final_decision_status}**")
+        st.caption(
+            "No final decision has been recorded. Nothing on this page makes, "
+            "proposes, or infers it."
+        )
 
     # --- RANKING CONTEXT --------------------------------------------
     st.divider()
@@ -1787,6 +1874,158 @@ def _render_final_scorecard(view) -> None:
             st.markdown(f"- {src}")
 
 
+def _run_record_final_decision(
+    application_id: str, decision: str, rationale: str, acting_user_id
+) -> None:
+    """Record (or revise) the final decision. Same four-way exception ladder as
+    the other HR actions. Never an AI call."""
+    try:
+        with session_scope() as db:
+            record_final_decision(
+                db,
+                application_id=uuid.UUID(application_id),
+                decision=decision,
+                rationale=rationale,
+                acting_user_id=acting_user_id,
+            )
+    except UnauthorizedError:
+        st.error("Your account is no longer active — please contact an admin.")
+        return
+    except FinalDecisionError as exc:
+        st.error(str(exc))
+        return
+    except SQLAlchemyError:
+        st.error(_DECISION_DB_ERROR)
+        return
+    except Exception:  # noqa: BLE001 - never surface a traceback
+        st.error(_DECISION_UNEXPECTED)
+        return
+
+    # A fresh form key on the next run empties the rationale box.
+    key = f"fd_ver_{application_id}"
+    st.session_state[key] = st.session_state.get(key, 0) + 1
+    success_toast("Final decision recorded.")
+    st.rerun()
+
+
+def _decision_badge(decision: str) -> str:
+    return badge(
+        recommendation_kind(decision), f"Final decision: {label_for(decision)}"
+    )
+
+
+def _render_final_decision_section(
+    application_id, decision_state, acting_user_id
+) -> None:
+    """The per-candidate "Final human decision" block (CLAUDE.md §11).
+
+    Shows the current decision (label + who + when + rationale), whether it rests
+    on earlier evidence, earlier decisions, and — for a hiring manager or admin —
+    the form to record or change it. Everyone else sees it read-only.
+    """
+    state = (decision_state or {}).get(application_id) or {}
+    current = state.get("current")
+    history = state.get("history") or []
+    staleness = state.get("staleness")
+
+    st.markdown("#### Final human decision")
+    st.caption(
+        "The hiring manager's decision (PROCEED / HOLD / REJECT). The AI does "
+        "not decide — scores, rankings and analyses are inputs only."
+    )
+
+    if not state:
+        st.caption("Decision details are not available for this candidate.")
+        return
+
+    if current is None:
+        st.caption("No final decision has been recorded yet.")
+    else:
+        st.markdown(_decision_badge(current.decision))
+        st.caption(
+            f"Decided by {current.decided_by_name} on "
+            f"{current.created_at:%Y-%m-%d %H:%M UTC}."
+        )
+        st.markdown("*Rationale*")
+        st.markdown(current.rationale)
+        if staleness is not None and staleness.is_stale:
+            st.warning(
+                _DECISION_STALE + "; ".join(staleness.reasons) + ". Review the "
+                "current scorecard and record a new decision if it changes your "
+                "view."
+            )
+
+    earlier = [h for h in history if h.status != FinalDecisionStatus.CURRENT]
+    if earlier:
+        with st.expander(f"Earlier decisions ({len(earlier)})", expanded=False):
+            st.caption(
+                "Kept, never overwritten. Each was the current decision until it "
+                "was changed."
+            )
+            for h in earlier:
+                st.markdown(_decision_badge(h.decision))
+                when = (
+                    f"{h.superseded_at:%Y-%m-%d}" if h.superseded_at else "unknown date"
+                )
+                st.caption(
+                    f"Decided by {h.decided_by_name} on {h.created_at:%Y-%m-%d} · "
+                    f"replaced {when}"
+                )
+                st.markdown(h.rationale)
+                st.divider()
+
+    role = (get_current_user(st.session_state) or {}).get("role")
+    if not role_may_decide(role):
+        st.info(
+            "Only a hiring manager or an admin can record the final decision. "
+            "You can read it here."
+        )
+        return
+
+    app_id = str(application_id)
+    version = st.session_state.get(f"fd_ver_{app_id}", 0)
+    st.markdown("**Change the decision**" if current else "**Record the decision**")
+    with st.form(f"fd_form_{app_id}_{version}", clear_on_submit=False):
+        choice = st.radio(
+            "Your decision",
+            _DECISION_ORDER,
+            index=None,
+            format_func=label_for,
+            horizontal=True,
+            key=f"fd_choice_{app_id}_{version}",
+        )
+        rationale = st.text_area(
+            "Rationale (required)",
+            key=f"fd_why_{app_id}_{version}",
+            max_chars=None,
+            help=(
+                f"Required, {RATIONALE_MIN_CHARS}–{RATIONALE_MAX_CHARS} "
+                "characters. Stored exactly as written."
+            ),
+            placeholder="Why this decision, in your own words.",
+        )
+        st.caption(
+            f"{RATIONALE_MIN_CHARS}–{RATIONALE_MAX_CHARS} characters. "
+            + _DECISION_EVIDENCE_ONLY
+        )
+        reviewed = confirmed(
+            "I have reviewed the scorecard, interview feedback and analysis",
+            key=f"fd_ok_{app_id}_{version}",
+        )
+        submitted = st.form_submit_button(
+            "Change final decision" if current else "Record final decision"
+        )
+        st.caption(_DECISION_RECORDED_ONLY)
+
+    if submitted:
+        if choice is None:
+            st.error(_DECISION_CHOOSE)
+        elif not reviewed:
+            st.error(_DECISION_CONFIRM_FIRST)
+        else:
+            _run_record_final_decision(app_id, choice, rationale, acting_user_id)
+
+
 def _render_final_scorecard_section(application_id, acting_user_id) -> None:
     """The per-candidate "Final scorecard" block.
 
@@ -1836,7 +2075,8 @@ def _render_final_scorecard_section(application_id, acting_user_id) -> None:
 
 
 def _render_candidate_row(
-    row, guide, feedback_state, analysis_state, acting_user_id
+    row, guide, feedback_state, analysis_state, acting_user_id,
+    decision_state=None,
 ) -> None:
     drift = ""
     if row.current_rank_available and row.current_rank_position is not None:
@@ -1887,6 +2127,9 @@ def _render_candidate_row(
         row.application_id, feedback_state, analysis_state, acting_user_id
     )
     _render_final_scorecard_section(row.application_id, acting_user_id)
+    _render_final_decision_section(
+        row.application_id, decision_state, acting_user_id
+    )
     st.divider()
 
 
@@ -1905,6 +2148,7 @@ def _render_shortlisted_section(job_id: str, acting_user_id) -> None:
     guides = view["guides_by_application"]
     feedback_state = view["feedback_by_application"]
     analysis_state = view["analysis_by_application"]
+    decision_state = view.get("decision_by_application")
 
     if not shortlisted:
         st.caption("No candidates are currently shortlisted for this job.")
@@ -1934,7 +2178,7 @@ def _render_shortlisted_section(job_id: str, acting_user_id) -> None:
             with st.container(border=True):
                 _render_candidate_row(
                     row, guides.get(row.application_id), feedback_state,
-                    analysis_state, acting_user_id,
+                    analysis_state, acting_user_id, decision_state,
                 )
 
     # Guides retained for candidates no longer shortlisted — readable, but no
@@ -1968,6 +2212,9 @@ def _render_shortlisted_section(job_id: str, acting_user_id) -> None:
                 )
                 _render_final_scorecard_section(
                     g.application_id, acting_user_id
+                )
+                _render_final_decision_section(
+                    g.application_id, decision_state, acting_user_id
                 )
 
 

@@ -321,3 +321,17 @@ def test_final_ranking_generated_audit_member_exists_and_is_emitted_only_by_its_
         AuditEventType.FINAL_RANKING_GENERATED.value == "FINAL_RANKING_GENERATED"
     )
     assert "FINAL_RANKING_GENERATED" != "RANKING_GENERATED"      # distinct from Step 5
+
+
+def test_final_decision_submitted_stays_declared_and_has_its_own_value():
+    """Step 11 emits the pre-declared member (no new enum value, no migration)."""
+    assert (
+        AuditEventType.FINAL_DECISION_SUBMITTED.value == "FINAL_DECISION_SUBMITTED"
+    )
+    assert AuditEventType.FINAL_DECISION_SUBMITTED.value != (
+        AuditEventType.FINAL_RANKING_GENERATED.value
+    )
+    # still unemitted: the disagreement member is separate and untouched
+    assert AuditEventType.AI_HUMAN_DISAGREEMENT_DETECTED.value == (
+        "AI_HUMAN_DISAGREEMENT_DETECTED"
+    )

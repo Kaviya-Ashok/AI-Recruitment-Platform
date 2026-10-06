@@ -1374,3 +1374,102 @@ def test_final_rankings_upgrade_downgrade_upgrade_roundtrip(migrate, temp_databa
             ), {"n": _ONE_CURRENT_RUN}).scalar_one() == 1
     finally:
         engine.dispose()
+
+
+# --- final decisions (migration d1e2f3a4b5c6) ---------------------------------
+
+_PRE_FD = "c0d1e2f3a4b5"
+_FD_REV = "d1e2f3a4b5c6"
+_ONE_CURRENT_DECISION = "uq_final_decisions_one_current_per_application"
+
+
+def test_final_decisions_table_columns_keys_and_partial_unique_index(
+    migrate, temp_database_url
+):
+    migrate("downgrade", "base")
+    migrate("upgrade", "head")
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+            cols = {c["name"]: c for c in inspector.get_columns("final_decisions")}
+            assert set(cols) == {
+                "id", "application_id", "decided_by_user_id", "decision",
+                "rationale", "status", "superseded_at", "final_ranking_entry_id",
+                "post_interview_analysis_id", "final_score", "final_rank",
+                "entry_status", "final_confidence", "rubric_version_id",
+                "ai_recommendation_snapshot", "interview_feedback_ids",
+                "created_at",
+            }
+            for name in ("id", "application_id", "decided_by_user_id", "decision",
+                         "rationale", "status", "interview_feedback_ids", "created_at"):
+                assert cols[name]["nullable"] is False, name
+            for name in ("superseded_at", "final_ranking_entry_id",
+                         "post_interview_analysis_id", "final_score", "final_rank",
+                         "entry_status", "final_confidence", "rubric_version_id",
+                         "ai_recommendation_snapshot"):
+                assert cols[name]["nullable"] is True, name
+            # created_at is set explicitly in Python — deliberately no default
+            assert cols["created_at"]["default"] is None
+            # no name / notes / transcript text columns
+            assert not any(
+                k in n for n in cols for k in ("name", "email", "notes", "transcript")
+            )
+
+            fks = {
+                fk["constrained_columns"][0]: (
+                    fk["referred_table"], fk["options"].get("ondelete")
+                )
+                for fk in inspector.get_foreign_keys("final_decisions")
+            }
+            assert fks == {
+                "application_id": ("applications", "RESTRICT"),
+                "decided_by_user_id": ("users", "RESTRICT"),
+                "final_ranking_entry_id": ("final_ranking_entries", "RESTRICT"),
+                "post_interview_analysis_id": ("post_interview_analyses", "RESTRICT"),
+            }
+            assert "candidate_rankings" not in {t for t, _ in fks.values()}
+
+            indexed = {
+                tuple(i["column_names"]) for i in inspector.get_indexes("final_decisions")
+            }
+            assert ("application_id",) in indexed
+
+            definition = conn.execute(sa.text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename = 'final_decisions' AND indexname = :n"
+            ), {"n": _ONE_CURRENT_DECISION}).scalar_one()
+            assert "UNIQUE" in definition and "(application_id)" in definition
+            assert "status" in definition and "CURRENT" in definition
+    finally:
+        engine.dispose()
+
+
+def test_final_decisions_upgrade_downgrade_upgrade_roundtrip(migrate, temp_database_url):
+    migrate("downgrade", "base")
+    migrate("upgrade", _FD_REV)
+    migrate("downgrade", _PRE_FD)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            tables = set(sa.inspect(conn).get_table_names())
+            assert "final_decisions" not in tables
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_DECISION}).scalar_one() == 0
+            assert {"final_ranking_entries", "post_interview_analyses"} <= tables
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _FD_REV)          # must not raise
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert "final_decisions" in sa.inspect(conn).get_table_names()
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_DECISION}).scalar_one() == 1
+    finally:
+        engine.dispose()
