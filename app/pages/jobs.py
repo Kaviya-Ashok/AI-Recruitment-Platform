@@ -50,7 +50,12 @@ from app.services.rubric_service import (
 from app.utils.parsing import DocumentParsingError
 from app.utils.session import get_current_user
 from app.utils.ui import entity_status_badge, label_for
-from app.utils.ui_widgets import confirmed, load_error, success_toast
+from app.utils.ui_widgets import (
+    confirmed,
+    load_error,
+    page_header,
+    success_toast,
+)
 from app.utils.validation import FileValidationError
 
 _PASTE = "Paste text"
@@ -815,7 +820,7 @@ def render_jobs_page() -> None:
     except (ValueError, KeyError, TypeError):
         created_by_user_id = None
 
-    st.title("Jobs")
+    page_header("Jobs")
     _render_create_form(created_by_user_id)
     st.divider()
     _render_job_list(created_by_user_id)

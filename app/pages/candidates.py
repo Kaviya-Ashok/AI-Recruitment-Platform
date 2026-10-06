@@ -103,6 +103,7 @@ from app.utils.ui_widgets import (
     job_picker,
     load_error,
     load_job_options,
+    page_header,
     success_toast,
 )
 
@@ -1316,7 +1317,7 @@ def render_candidates_page() -> None:
         st.error("Your session looks invalid — please sign out and back in.")
         return
 
-    st.title("Candidates")
+    page_header("Candidates")
 
     try:
         jobs = load_job_options()

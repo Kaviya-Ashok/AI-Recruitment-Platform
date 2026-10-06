@@ -146,6 +146,14 @@ _PALETTE: dict[str, str] = {
 BADGE_KINDS: frozenset[str] = frozenset(_PALETTE)
 
 
+def badge_color(kind: str | None) -> str:
+    """The Streamlit colour token for one palette slot (``st.badge(color=...)``).
+
+    Pure. An unknown or missing ``kind`` falls back to gray, like :func:`badge`.
+    """
+    return _PALETTE.get(kind or "", "gray")
+
+
 def badge(kind: str, text: str) -> str:
     """Return the Streamlit coloured-badge markdown for one palette slot.
 

@@ -131,6 +131,7 @@ from app.utils.ui_widgets import (
     job_picker,
     load_error,
     load_job_options,
+    page_header,
     success_toast,
 )
 
@@ -2230,11 +2231,11 @@ def render_interviews_page() -> None:
         st.error("Your session looks invalid — please sign out and back in.")
         return
 
-    st.title("Interviews")
-    st.caption(
+    page_header(
+        "Interviews",
         "Interview guides for shortlisted candidates. The MVP has no live AI "
         "interviewer — the guide is generated here for a human interviewer to "
-        "run the interview."
+        "run the interview.",
     )
 
     try:

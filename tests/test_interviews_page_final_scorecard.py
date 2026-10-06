@@ -461,6 +461,9 @@ def test_no_transcript_shows_an_honest_unavailable_message():
 
 
 def test_page_uses_no_unsafe_html_or_custom_css():
+    # Still true after the HR design foundation: the page file itself has no raw
+    # HTML. The app's ONE unsafe_allow_html call lives in app/ui/theme.py, and
+    # tests/test_ui_theme.py enforces that it is the only one under app/.
     import pathlib
     src = pathlib.Path("app/pages/interviews.py").read_text(encoding="utf-8")
     for forbidden in ("unsafe_allow_html", "<style", "<div", "<span", "<script"):

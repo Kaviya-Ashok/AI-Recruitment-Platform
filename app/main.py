@@ -52,7 +52,9 @@ from app.utils.session import (
     is_authenticated,
     set_current_user,
 )
+from app.ui.theme import inject_theme
 from app.utils.ui import label_for
+from app.utils.ui_widgets import page_header
 
 st.set_page_config(
     page_title="Recruitment Intelligence Platform",
@@ -184,9 +186,9 @@ def _gather_landing_data(acting_user_id: uuid.UUID) -> dict:
 
 def _dashboard_page() -> None:
     current = get_current_user(st.session_state)
-    st.title("Dashboard")
-    st.caption(
-        f"Signed in as {current['full_name']} · {label_for(current['role'])}"
+    page_header(
+        "Dashboard",
+        f"Signed in as {current['full_name']} · {label_for(current['role'])}",
     )
 
     acting_user_id = _acting_user_id()
@@ -253,6 +255,9 @@ _PAGES: dict[str, st.Page] = {
 
 
 def main() -> None:
+    # Once per run, BEFORE either branch, so the login screen and every
+    # authenticated page get the one static stylesheet (app/ui/theme.py).
+    inject_theme()
     if not is_authenticated(st.session_state):
         st.navigation([st.Page(_login_page, title="Sign in")], position="hidden").run()
         return

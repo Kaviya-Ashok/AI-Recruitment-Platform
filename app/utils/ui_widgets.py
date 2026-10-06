@@ -27,7 +27,7 @@ import streamlit as st
 
 from app.database.database import session_scope
 from app.services.job_service import list_jobs
-from app.utils.ui import label_for
+from app.utils.ui import badge_color, label_for
 
 # ---------------------------------------------------------------------------
 # Destructive-action gate
@@ -153,6 +153,43 @@ def success_toast(message: str) -> None:
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
+
+
+def page_header(
+    title: str,
+    subtitle: str | None = None,
+    code: str | None = None,
+    status_kind: str | None = None,
+    status_text: str | None = None,
+) -> None:
+    """The title block every HR page opens with, from native elements only.
+
+    ``st.title`` for the title (so it is the page's one ``h1``), an optional row
+    holding a short ``code`` (for example a job code) and a status ``st.badge``,
+    then an optional ``st.caption`` subtitle. No HTML, no CSS — the look comes
+    from the injected stylesheet (``app/ui/theme.py``).
+
+    ``status_kind`` is one of the palette kinds in ``app/utils/ui.py``
+    (positive / caution / negative / neutral / info); the badge always carries
+    ``status_text``, so status never relies on colour alone. A badge is drawn only
+    when BOTH ``status_text`` is given; ``status_kind`` defaults to neutral.
+    """
+    st.title(title)
+    items: list[tuple[str, str]] = []
+    if code:
+        items.append(("code", str(code)))
+    if status_text:
+        items.append(("status", str(status_text)))
+    if items:
+        cols = st.columns([1] * len(items) + [8], vertical_alignment="center")
+        for col, (what, value) in zip(cols, items):
+            if what == "code":
+                # backticks would end the inline-code span early
+                col.markdown("`" + value.replace("`", "'") + "`")
+            else:
+                col.badge(value, color=badge_color(status_kind))
+    if subtitle:
+        st.caption(subtitle)
 
 
 def detail_lines(pairs: Iterable[tuple[str, object]]) -> None:
