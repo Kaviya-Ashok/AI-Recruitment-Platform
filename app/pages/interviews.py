@@ -27,6 +27,11 @@ Scope (deliberately minimal)
   replaced. Replaced versions are kept. Transcripts are only stored and shown
   here — no AI reads them.
 
+* Step 10b: a per-job "Final ranking (post-interview)" section. HR triggers it
+  explicitly; it shows final score = 40% screening + 60% interview (all rounds
+  equal), with the breakdown, caveats, ties, the ineligible and incomplete lists,
+  a stale banner and earlier runs. No AI is involved and nothing is rejected.
+
 Rendered via ``st.navigation`` from ``app/main.py`` (never auto-discovered).
 100% HR-only — no candidate-facing surface is touched. Business logic lives in
 ``interview_guide_service``; this file is thin glue.
@@ -44,12 +49,20 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.database import session_scope
 from app.database.models.interview_feedback import RATING_MAX, RATING_MIN
+from app.database.models.final_ranking import FinalRankingEntryStatus
 from app.database.models.interview_guide import InterviewQuestionCategory
 from app.database.models.interview_transcript import InterviewTranscriptStatus
 from app.database.models.post_interview_analysis import (
     PostInterviewAnalysisStatus,
 )
 from app.database.models.screening_evaluation import ScreeningRecommendation
+from app.services.final_ranking_service import (
+    FinalRankingError,
+    generate_final_ranking,
+    get_current_final_ranking,
+    get_final_ranking_staleness,
+    list_final_ranking_history,
+)
 from app.services.final_scorecard_service import (
     MULTIPLE_RUBRIC_VERSIONS_WARNING,
     FinalScorecardActorError,
@@ -118,6 +131,15 @@ _TRANSCRIPT_UPLOAD_LABEL = "Interview transcript (PDF or DOCX, up to 10 MB)"
 _TRANSCRIPT_NOT_EXTRACTABLE = (
     "This file has no readable text (it is probably a scan). It can be "
     "stored, but an AI analysis will not be able to use it."
+)
+_FINAL_RANK_DB_ERROR = "Couldn't save the final ranking — please try again."
+_FINAL_RANK_UNEXPECTED = (
+    "Something went wrong generating the final ranking. Please try again."
+)
+_FINAL_RANK_STALE_HINT = "Regenerate before relying on the order."
+_FINAL_RANK_TIE_CAPTION = (
+    "Tied candidates share a rank. The on-screen order within a tie carries no "
+    "meaning."
 )
 _ANALYSIS_STALE = (
     "Feedback or a transcript was added or replaced after this analysis was "
@@ -812,6 +834,279 @@ def _analysis_is_stale(analysis, feedback_state: dict | None) -> bool:
     return current_transcripts != recorded_transcripts
 
 
+def _load_final_ranking_view(job_id: str, acting_user_id) -> dict:
+    with session_scope() as db:
+        return {
+            "current": get_current_final_ranking(
+                db, job_id=job_id, acting_user_id=acting_user_id
+            ),
+            "history": list_final_ranking_history(
+                db, job_id=job_id, acting_user_id=acting_user_id
+            ),
+            "staleness": get_final_ranking_staleness(
+                db, job_id=job_id, acting_user_id=acting_user_id
+            ),
+        }
+
+
+def _run_generate_final_ranking(job_id: str, acting_user_id) -> None:
+    """Explicit HR trigger only — never run on page load. Same four-way
+    exception ladder as the other HR actions."""
+    try:
+        with st.spinner("Calculating the final ranking…"):
+            with session_scope() as db:
+                generate_final_ranking(
+                    db, job_id=uuid.UUID(job_id), requested_by_user_id=acting_user_id
+                )
+    except UnauthorizedError:
+        st.error("Your account is no longer active — please contact an admin.")
+        return
+    except FinalRankingError as exc:
+        st.error(str(exc))
+        return
+    except SQLAlchemyError:
+        st.error(_FINAL_RANK_DB_ERROR)
+        return
+    except Exception:  # noqa: BLE001 - never surface a traceback
+        st.error(_FINAL_RANK_UNEXPECTED)
+        return
+
+    success_toast("Final ranking generated.")
+    st.rerun()
+
+
+def _render_final_entry_breakdown(entry, run) -> None:
+    """The numbers behind one score, so it is never shown bare."""
+    if entry.screening_score is not None and entry.interview_score is not None:
+        st.caption(
+            f"Breakdown: {_weight_pct(run.screening_weight)} × screening "
+            f"{_d2(entry.screening_score)} + "
+            f"{_weight_pct(run.interview_weight)} × interview "
+            f"{_d2(entry.interview_score)}"
+            + (f" = {_d2(entry.final_score)}" if entry.final_score is not None else "")
+            + ". Screening and interview scores are each rounded to 2 decimals "
+            "before weighting."
+        )
+    else:
+        st.caption(
+            f"Screening score {_d2(entry.screening_score)} · interview score "
+            f"{_d2(entry.interview_score)}"
+        )
+    if entry.round_means:
+        parts = ", ".join(
+            f"round {r}: mean {m:.2f}/5" for r, m in entry.round_means
+        )
+        st.caption(
+            f"Interview rounds used — {parts}. Every round counts equally; "
+            "rounds without ratings are not scored."
+        )
+    if entry.screening_rank is not None:
+        st.caption(f"Pre-interview screening rank: #{entry.screening_rank}.")
+
+
+def _render_final_entry_context(entry) -> None:
+    """Analysis pointers (AI-generated, context only) and the confidence note."""
+    if entry.final_confidence:
+        st.markdown(
+            badge(
+                confidence_kind(entry.final_confidence),
+                f"Confidence: {label_for(entry.final_confidence)}",
+            )
+        )
+        st.caption(
+            "Confidence is the lowest of the screening confidence "
+            f"({label_for(entry.screening_confidence) if entry.screening_confidence else 'unknown'})"
+            " and the post-interview analysis confidence; with no analysis it is "
+            "capped at Medium. It is not part of the score."
+        )
+    if entry.analysis_recommendation:
+        st.caption(
+            "AI-generated post-interview analysis (context only — it is NOT part "
+            f"of the score): confidence {label_for(entry.analysis_confidence)}, "
+            f"recommends {label_for(entry.analysis_recommendation)}. See the "
+            "analysis on the candidate's card."
+        )
+    else:
+        st.caption(
+            "No post-interview analysis counted for this candidate (none "
+            "generated, or generated for a different rubric version)."
+        )
+
+
+def _render_final_ranked_row(entry, run) -> None:
+    tie = (
+        "  " + entity_badge("ranking", "caution", "Tied — shares this rank")
+        if entry.tied else ""
+    )
+    st.markdown(
+        f"**#{entry.rank}. {entry.candidate_name}**  ·  final "
+        f"{score_out_of_ten(entry.final_score, places=2)}{tie}"
+    )
+    st.caption(entry.candidate_email)
+    if entry.mandatory_unknown:
+        st.warning(
+            "⚠️ A mandatory requirement had no evidence either way for this "
+            "candidate — the rank reflects only what could be assessed. Not a "
+            "failure; worth confirming at interview.",
+            icon="⚠️",
+        )
+    _render_final_entry_breakdown(entry, run)
+    _render_final_entry_context(entry)
+    if entry.status_reason:
+        st.caption(entry.status_reason)
+    st.divider()
+
+
+def _render_final_unranked_row(entry, run) -> None:
+    ineligible = entry.entry_status == FinalRankingEntryStatus.NOT_RANKED_INELIGIBLE
+    label = (
+        "Not ranked — mandatory requirement not met" if ineligible
+        else "Incomplete — no final score"
+    )
+    st.markdown(
+        f"**{entry.candidate_name}**  "
+        + entity_badge("ranking", "negative" if ineligible else "neutral", label)
+        + (
+            f"  ·  final (for context) "
+            f"{score_out_of_ten(entry.final_score, places=2)}"
+            if entry.final_score is not None else ""
+        )
+    )
+    st.caption(entry.candidate_email)
+    _render_final_entry_breakdown(entry, run)
+    if entry.final_score is not None:
+        _render_final_entry_context(entry)
+    st.caption(entry.status_reason)
+    st.divider()
+
+
+def _render_final_ranking_section(job_id: str, acting_user_id) -> None:
+    """Per-job post-interview final ranking (Step 10b). Thin glue — every number
+    comes from ``final_ranking_service``; nothing is calculated here."""
+    st.subheader("Final ranking (post-interview)")
+    st.caption(
+        "Final score = 40% screening score + 60% interview score, on a 0–10 "
+        "scale. The interview score averages every round's ratings, each round "
+        "counting equally. Calculated by fixed rules — the AI never assigns a "
+        "score, transcripts do not change the number, and the AI analysis and "
+        "recommendations are shown as context only. This ranking does not "
+        "reject or approve anyone: the hiring manager decides."
+    )
+
+    try:
+        view = _load_final_ranking_view(job_id, acting_user_id)
+    except (UnauthorizedError, SQLAlchemyError, ValueError):
+        load_error("Couldn't load the final ranking right now.")
+        return
+
+    current = view["current"]
+    if st.button(
+        "Regenerate final ranking" if current else "Generate final ranking",
+        key=f"final_rank_{job_id}",
+        help="Scores and ranks every candidate who has interview feedback.",
+    ):
+        _run_generate_final_ranking(job_id, acting_user_id)
+
+    if not current:
+        st.caption("No final ranking has been generated for this job yet.")
+        return
+
+    staleness = view["staleness"]
+    if staleness.is_stale:
+        st.markdown(
+            entity_badge(
+                "ranking",
+                "caution",
+                "Final ranking may be out of date — "
+                + "; ".join(staleness.reasons),
+            )
+        )
+        st.caption(_FINAL_RANK_STALE_HINT)
+
+    for run in current:
+        version = (
+            f"Rubric v{run.rubric_version_number}"
+            if run.rubric_version_number is not None
+            else "Rubric (unknown version)"
+        )
+        st.markdown(f"#### {version}")
+        st.caption(
+            f"Generated {run.created_at:%Y-%m-%d %H:%M UTC} by "
+            f"{run.requested_by_name} · weights: screening "
+            f"{_weight_pct(run.screening_weight)}, interview "
+            f"{_weight_pct(run.interview_weight)}. Candidates scored against "
+            "different rubric versions are never ranked together."
+        )
+        ranked = [
+            e for e in run.entries
+            if e.entry_status == FinalRankingEntryStatus.RANKED
+        ]
+        ineligible = [
+            e for e in run.entries
+            if e.entry_status == FinalRankingEntryStatus.NOT_RANKED_INELIGIBLE
+        ]
+        incomplete = [
+            e for e in run.entries
+            if e.entry_status in (
+                FinalRankingEntryStatus.INCOMPLETE_SCREENING,
+                FinalRankingEntryStatus.INCOMPLETE_INTERVIEW,
+            )
+        ]
+        if any(e.tied for e in ranked):
+            st.caption(_FINAL_RANK_TIE_CAPTION)
+        if not ranked:
+            st.caption("No candidate in this group could be ranked.")
+        for e in ranked:
+            _render_final_ranked_row(e, run)
+        if ineligible:
+            st.markdown(f"##### Not ranked — ineligible ({len(ineligible)})")
+            st.caption(
+                "A mandatory requirement was assessed as not met at screening. "
+                "Scores are shown for context only. This is not a rejection; "
+                "that remains a human decision."
+            )
+            for e in ineligible:
+                _render_final_unranked_row(e, run)
+        if incomplete:
+            st.markdown(f"##### Incomplete ({len(incomplete)})")
+            st.caption(
+                "No final score — a part is missing. Nothing is scored as zero "
+                "and the weights are never redistributed."
+            )
+            for e in incomplete:
+                _render_final_unranked_row(e, run)
+
+    earlier = [h for h in view["history"] if h.status != "CURRENT"]
+    if earlier:
+        with st.expander(f"Earlier runs ({len(earlier)})", expanded=False):
+            st.caption(
+                "Kept, never overwritten. Each was the current final ranking "
+                "until it was regenerated."
+            )
+            for h in earlier:
+                ranked_n = sum(
+                    1 for e in h.entries
+                    if e.entry_status == FinalRankingEntryStatus.RANKED
+                )
+                when = (
+                    f"{h.superseded_at:%Y-%m-%d}" if h.superseded_at else "unknown date"
+                )
+                top = next(
+                    (e for e in h.entries
+                     if e.entry_status == FinalRankingEntryStatus.RANKED),
+                    None,
+                )
+                st.markdown(
+                    f"- Rubric v{h.rubric_version_number} · generated "
+                    f"{h.created_at:%Y-%m-%d %H:%M} by {h.requested_by_name} · "
+                    f"superseded {when} · {ranked_n} ranked"
+                    + (
+                        f" · top: {top.candidate_name} "
+                        f"({_d2(top.final_score)})" if top else ""
+                    )
+                )
+
+
 def _render_analysis_body(analysis) -> None:
     """The prose of one analysis. AI-generated throughout — the caller is
     responsible for saying so before calling this."""
@@ -1025,6 +1320,59 @@ def _scorecard_open_key(application_id) -> str:
     return f"final_scorecard_open_{application_id}"
 
 
+def _d2(value) -> str:
+    return "—" if value is None else f"{value:.2f}"
+
+
+def _weight_pct(weight) -> str:
+    return f"{int(round(float(weight) * 100))}%"
+
+
+def _render_scorecard_final_ranking(final) -> None:
+    """The candidate's entry in the latest final ranking, read as stored."""
+    st.divider()
+    st.markdown("### Final score and rank (post-interview)")
+    if final is None:
+        st.caption("Final ranking not generated yet.")
+        return
+    st.caption(
+        f"System-calculated, read from the final ranking generated "
+        f"{final.generated_at:%Y-%m-%d %H:%M UTC}. Not AI-produced, and not a "
+        "hiring decision."
+    )
+    if final.entry_status == FinalRankingEntryStatus.RANKED:
+        tie = " (tied)" if final.tied else ""
+        st.markdown(
+            f"**Final score:** {score_out_of_ten(final.final_score, places=2)}"
+            f" · rank #{final.rank} of {final.ranked_count}{tie}"
+        )
+    elif final.final_score is not None:
+        st.markdown(
+            f"**Final score (not ranked):** "
+            f"{score_out_of_ten(final.final_score, places=2)}"
+        )
+    else:
+        st.markdown("**No final score**")
+    if final.screening_score is not None and final.interview_score is not None:
+        st.caption(
+            f"{_weight_pct(final.screening_weight)} × screening "
+            f"{_d2(final.screening_score)} + "
+            f"{_weight_pct(final.interview_weight)} × interview "
+            f"{_d2(final.interview_score)}."
+        )
+    if final.final_confidence:
+        st.markdown(
+            badge(
+                confidence_kind(final.final_confidence),
+                f"Confidence: {label_for(final.final_confidence)}",
+            )
+        )
+    if final.status_reason:
+        st.caption(final.status_reason)
+    if final.tied:
+        st.caption(_FINAL_RANK_TIE_CAPTION)
+
+
 def _bucket_line(bucket) -> None:
     """One §10 score section: the number AND the evidence behind it.
 
@@ -1042,7 +1390,9 @@ def _bucket_line(bucket) -> None:
         else ""
     )
     st.markdown(
-        f"**{bucket.label}: {score_out_of_ten(bucket.score)}**{coverage}"
+        f"**{bucket.label}: "
+        f"{score_out_of_ten(bucket.score, places=getattr(bucket, 'score_places', 0))}"
+        f"**{coverage}"
     )
     st.caption(f"Source: {bucket.provenance}")
     if bucket.evidence:
@@ -1302,10 +1652,25 @@ def _render_final_scorecard(view) -> None:
         _bucket_line(bucket)
         st.markdown("")
     st.caption(
-        "Interview score is the mean competency rating as a proportion of the "
-        f"{RATING_MAX}-point scale, expressed out of 10. Confidence is not part "
-        "of any score."
+        "Interview score is the mean of each round's mean competency rating "
+        f"(every round counts equally), as a proportion of the {RATING_MAX}-point "
+        "scale, expressed out of 10 and rounded half-up to 2 decimals. "
+        "Confidence is not part of any score."
     )
+    rounds_used = getattr(view, "interview_rounds_used", ()) or ()
+    if rounds_used:
+        st.caption(
+            f"The Interview score uses {_rounds_phrase(rounds_used)}, every "
+            "round counting equally."
+        )
+    unscored = getattr(view, "interview_rounds_unscored", ()) or ()
+    if unscored:
+        st.caption(
+            f"Not scored (feedback without ratings, never counted as zero): "
+            f"{_rounds_phrase(unscored)}."
+        )
+
+    _render_scorecard_final_ranking(getattr(view, "final_ranking", None))
 
     # --- RECOMMENDATIONS --------------------------------------------
     st.divider()
@@ -1637,4 +2002,6 @@ def render_interviews_page() -> None:
     job_id = job_picker(jobs, key=HR_JOB_PICKER_KEY)
     if job_id is None:
         return
+    _render_final_ranking_section(job_id, acting_user_id)
+    st.divider()
     _render_shortlisted_section(job_id, acting_user_id)

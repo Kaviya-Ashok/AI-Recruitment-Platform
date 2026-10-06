@@ -15,6 +15,12 @@ from app.database.models.audit_event import AuditEvent, AuditEventType
 from app.database.models.candidate import Candidate
 from app.database.models.candidate_ranking import CandidateRanking
 from app.database.models.candidate_shortlist_entry import CandidateShortlistEntry
+from app.database.models.final_ranking import (
+    FinalRanking,
+    FinalRankingEntry,
+    FinalRankingEntryStatus,
+    FinalRankingStatus,
+)
 from app.database.models.interview_feedback import (
     MIN_INTERVIEW_ROUND,
     RATING_MAX,
@@ -84,6 +90,10 @@ __all__ = [
     "Candidate",
     "CandidateRanking",
     "CandidateShortlistEntry",
+    "FinalRanking",
+    "FinalRankingEntry",
+    "FinalRankingEntryStatus",
+    "FinalRankingStatus",
     "InterviewFeedback",
     "InterviewFeedbackRating",
     "InterviewGuide",

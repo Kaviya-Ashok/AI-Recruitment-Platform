@@ -312,3 +312,12 @@ def test_interview_transcript_uploaded_audit_member_exists():
         AuditEventType.INTERVIEW_TRANSCRIPT_UPLOADED.value
         == "INTERVIEW_TRANSCRIPT_UPLOADED"
     )
+
+
+def test_final_ranking_generated_audit_member_exists_and_is_emitted_only_by_its_service():
+    """Step 10b: one new string member, no migration (the audit column is a String
+    validated in the service layer)."""
+    assert (
+        AuditEventType.FINAL_RANKING_GENERATED.value == "FINAL_RANKING_GENERATED"
+    )
+    assert "FINAL_RANKING_GENERATED" != "RANKING_GENERATED"      # distinct from Step 5

@@ -113,6 +113,9 @@ class AuditEventType(str, enum.Enum):
     AI_HUMAN_DISAGREEMENT_DETECTED = "AI_HUMAN_DISAGREEMENT_DETECTED"
     POST_INTERVIEW_ANALYSIS_COMPLETED = "POST_INTERVIEW_ANALYSIS_COMPLETED"
     RANKING_GENERATED = "RANKING_GENERATED"
+    # Step 10b: HR generated the post-interview FINAL ranking for one job /
+    # rubric-version partition. Structural metadata only (ids, weights, counts).
+    FINAL_RANKING_GENERATED = "FINAL_RANKING_GENERATED"
     FINAL_DECISION_SUBMITTED = "FINAL_DECISION_SUBMITTED"
 
 

@@ -1251,3 +1251,126 @@ def test_pia_migration_upgrade_downgrade_upgrade_roundtrip(
             )).scalar_one() == 2
     finally:
         engine.dispose()
+
+
+# --- final rankings (migration c0d1e2f3a4b5) ----------------------------------
+
+_PRE_FR = "b9c0d1e2f3a4"
+_FR_REV = "c0d1e2f3a4b5"
+_ONE_CURRENT_RUN = "uq_final_rankings_one_current_per_partition"
+
+
+def test_final_rankings_tables_columns_keys_and_partial_unique_index(
+    migrate, temp_database_url
+):
+    migrate("downgrade", "base")
+    migrate("upgrade", "head")
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            inspector = sa.inspect(conn)
+
+            runs = {c["name"]: c for c in inspector.get_columns("final_rankings")}
+            assert set(runs) == {
+                "id", "job_id", "rubric_version_id", "requested_by_user_id",
+                "screening_weight", "interview_weight", "status",
+                "superseded_at", "created_at",
+            }
+            assert runs["superseded_at"]["nullable"] is True
+
+            entries = {
+                c["name"]: c for c in inspector.get_columns("final_ranking_entries")
+            }
+            assert set(entries) == {
+                "id", "final_ranking_id", "application_id", "screening_score",
+                "interview_score", "final_score", "rank", "eligible",
+                "mandatory_unknown", "entry_status", "status_reason",
+                "final_confidence", "screening_confidence",
+                "screening_generation_batch_id", "screening_generated_at",
+                "screening_rank", "post_interview_analysis_id", "rounds_used",
+                "round_means", "feedback_ids",
+            }
+            for name in ("screening_score", "interview_score", "final_score", "rank"):
+                assert entries[name]["nullable"] is True
+            # No name / notes / evidence / transcript column of any kind.
+            assert not any(
+                k in n for n in entries for k in ("name", "email", "notes", "evidence", "transcript")
+            )
+
+            def fks(table):
+                return {
+                    fk["constrained_columns"][0]: (
+                        fk["referred_table"], fk["options"].get("ondelete")
+                    )
+                    for fk in inspector.get_foreign_keys(table)
+                }
+
+            assert fks("final_rankings") == {
+                "job_id": ("jobs", "RESTRICT"),
+                "rubric_version_id": ("rubric_versions", "RESTRICT"),
+                "requested_by_user_id": ("users", "RESTRICT"),
+            }
+            assert fks("final_ranking_entries") == {
+                "final_ranking_id": ("final_rankings", "RESTRICT"),
+                "application_id": ("applications", "RESTRICT"),
+                "post_interview_analysis_id": ("post_interview_analyses", "RESTRICT"),
+            }
+            # deliberately NO foreign key into Step 5 / the evaluations
+            referred = {
+                fk["referred_table"]
+                for fk in inspector.get_foreign_keys("final_ranking_entries")
+            }
+            assert "candidate_rankings" not in referred
+            assert "screening_evaluations" not in referred
+
+            uniques = {
+                u["name"]: u["column_names"]
+                for u in inspector.get_unique_constraints("final_ranking_entries")
+            }
+            assert uniques["uq_final_ranking_entries_run_application"] == [
+                "final_ranking_id", "application_id",
+            ]
+
+            definition = conn.execute(sa.text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE tablename = 'final_rankings' AND indexname = :n"
+            ), {"n": _ONE_CURRENT_RUN}).scalar_one()
+            assert "UNIQUE" in definition
+            assert "(job_id, rubric_version_id)" in definition
+            assert "status" in definition and "CURRENT" in definition
+    finally:
+        engine.dispose()
+
+
+def test_final_rankings_upgrade_downgrade_upgrade_roundtrip(migrate, temp_database_url):
+    migrate("downgrade", "base")
+    migrate("upgrade", _FR_REV)
+    migrate("downgrade", _PRE_FR)
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            tables = set(sa.inspect(conn).get_table_names())
+            assert "final_rankings" not in tables
+            assert "final_ranking_entries" not in tables
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_RUN}).scalar_one() == 0
+            # the tables it pointed at are untouched
+            assert "post_interview_analyses" in tables and "applications" in tables
+    finally:
+        engine.dispose()
+
+    migrate("upgrade", _FR_REV)          # must not raise
+
+    engine = sa.create_engine(temp_database_url, future=True)
+    try:
+        with engine.connect() as conn:
+            assert {"final_rankings", "final_ranking_entries"} <= set(
+                sa.inspect(conn).get_table_names()
+            )
+            assert conn.execute(sa.text(
+                "SELECT count(*) FROM pg_indexes WHERE indexname = :n"
+            ), {"n": _ONE_CURRENT_RUN}).scalar_one() == 1
+    finally:
+        engine.dispose()

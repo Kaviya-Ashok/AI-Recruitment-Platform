@@ -43,6 +43,7 @@ _PATCHED_ATTRS = (
     "load_job_options",
     "get_final_scorecard",
     "_render_feedback_section",
+    "_render_final_ranking_section",
     "_render_analysis_section",
     "_render_shortlisted_section",
 )
@@ -251,6 +252,9 @@ I.load_job_options = lambda: [
 ]
 # Steps 7-9 blocks are not under test here.
 I._render_feedback_section = lambda *a, **k: None
+# Step 10b's per-job final-ranking section is not under test here (and would hit
+# the database); stubbed like the other sections.
+I._render_final_ranking_section = lambda *a, **k: None
 I._render_analysis_section = lambda *a, **k: None
 
 if {open_panel}:

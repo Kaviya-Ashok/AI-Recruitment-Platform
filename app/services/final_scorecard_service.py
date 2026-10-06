@@ -41,7 +41,9 @@ WHAT THIS MODULE DOES *NOT* DO
 * **No new scoring methodology.** Every score shown is either read verbatim
   from its originating row, or — for the Interview bucket alone, which §10
   requires and no existing step computes — derived by the single documented
-  formula in :func:`compute_interview_score`.
+  formula in :func:`app.services.final_scoring.compute_interview_score_all_rounds`
+  (Step 10b moved it there: ALL interview rounds count equally, 2 decimals,
+  half-up, one source of truth shared with the final ranking).
 * **No writes at all.** No ``Application.status`` change, no rejection, no
   upstream mutation. This module issues reads only.
 
@@ -78,6 +80,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -88,6 +91,11 @@ from app.database.models.job import Job
 from app.database.models.job_requirement import RequirementType
 from app.database.models.rubric import RubricVersion
 from app.database.models.user import SYSTEM_USER_ID, User, UserRole
+from app.services.final_ranking_service import get_final_ranking_for_application
+from app.services.final_scoring import (
+    compute_interview_score_all_rounds,
+    interview_round_means,
+)
 from app.services.interview_feedback_service import list_feedback_views
 from app.services.interview_guide_service import (
     get_interview_guide_for_application,
@@ -229,11 +237,15 @@ class ScorecardBucket:
     """
 
     label: str
-    score: int | None
+    # int for the screening buckets; Decimal (2 places) for the Interview score.
+    score: "int | Decimal | None"
     coverage: float | None
     evidence: tuple[str, ...]
     provenance: str
     unavailable_reason: str | None
+    # How many decimals the UI shows: 0 for the whole-number screening buckets,
+    # 2 for the Interview score.
+    score_places: int = 0
 
 
 @dataclass(frozen=True)
@@ -286,6 +298,25 @@ class ScorecardRanking:
     is_shortlisted: bool | None
     rank_position_at_decision: int | None
     shortlist_reason: str | None
+
+
+@dataclass(frozen=True)
+class ScorecardFinalRanking:
+    """The candidate's entry in the latest CURRENT final ranking, read as stored.
+    Nothing here is recomputed by the scorecard."""
+
+    entry_status: str
+    status_reason: str
+    final_score: Decimal | None
+    screening_score: Decimal | None
+    interview_score: Decimal | None
+    rank: int | None
+    tied: bool
+    ranked_count: int
+    final_confidence: str | None
+    screening_weight: Decimal
+    interview_weight: Decimal
+    generated_at: datetime
 
 
 @dataclass(frozen=True)
@@ -374,70 +405,30 @@ class FinalScorecardView:
     # --- what the post-interview analysis actually read (Increment C) ---
     # Rounds of feedback / CURRENT transcripts that informed the displayed
     # analysis, and whether it is a pre-Increment-C row that read only the most
-    # recent record. Informational only: the Interview SCORE above is unchanged
-    # and still derives from the latest feedback record alone.
+    # recent record. Informational only. (Since Step 10b the Interview SCORE uses
+    # ALL rounds, so both now describe all rounds; legacy analyses are the
+    # exception and say so.)
     post_interview_feedback_rounds: tuple[int, ...] = ()
     post_interview_transcript_rounds: tuple[int, ...] = ()
     post_interview_read_latest_only: bool = False
+
+    # --- Step 10b: interview score scope + the post-interview final ranking ---
+    # Rounds whose ratings make up the Interview score, and rounds that have
+    # feedback but NO ratings (excluded, never counted as zero).
+    interview_rounds_used: tuple[int, ...] = ()
+    interview_rounds_unscored: tuple[int, ...] = ()
+    # This candidate's entry in the latest CURRENT final ranking, read-only; None
+    # when no final ranking has been generated for them yet.
+    final_ranking: "ScorecardFinalRanking | None" = None
 
 
 # --- the one score this module derives (CLAUDE.md §§10, 20) -----------
 
 
-def compute_interview_score(ratings: list[int]) -> int | None:
-    """Deterministic Interview score, 0-10, from competency ratings.
-
-    CLAUDE.md §10 names an ``## Interview / Score:`` section, and **no existing
-    step computes one** — the only interview numbers in the schema are
-    ``interview_feedback_ratings.rating`` (1-5, one per competency). This is the
-    single derivation this module performs, and it is pure Python: no AI is ever
-    asked for a numeric interview score.
-
-    THE FORMULA — verbatim
-    ----------------------
-        if there are no ratings          -> None  (never 0 — see below)
-        else  mean   = sum(ratings) / count
-              score  = round(10 * mean / RATING_MAX)     # RATING_MAX = 5
-              clamped to [0, 10]
-
-    WHY ``mean / RATING_MAX`` (proportion of the maximum)
-    -----------------------------------------------------
-    It is the direct analogue of ``screening_scoring``'s bucket formula, which
-    is ``10 * achieved_points / possible_points``. There, a PASS contributes
-    1.0 of a possible 1.0; here a rating contributes ``rating`` of a possible
-    ``RATING_MAX``. Keeping the same "proportion of what was achievable × 10"
-    shape means the Interview score reads on the same scale as the
-    Requirements / Experience / Behavioral scores beside it.
-
-    A rejected alternative, recorded so the choice is auditable: mapping the
-    1-5 band onto 0-10 as ``10 * (mean - 1) / (RATING_MAX - 1)`` would make a
-    straight-1s interview score 0. That treats the bottom of the interviewer's
-    scale as "zero merit", which is a stronger claim than the interviewer made —
-    they chose the lowest *available* rating, and 1/5 is not 0/5.
-
-    WHY THE MEAN IS UNWEIGHTED
-    --------------------------
-    ``competency_label`` is free text with no controlled taxonomy and is
-    deliberately not linked to ``rubric_criteria`` (see the
-    ``InterviewFeedbackRating`` model docstring). There is therefore no
-    principled basis on which to weight one competency above another, and
-    inventing one would be exactly the fabricated methodology CLAUDE.md §20
-    forbids.
-
-    WHY EMPTY IS ``None`` AND NOT ``0``
-    -----------------------------------
-    Notes-only feedback is legitimate (Step 8 allows it). No ratings means the
-    interview was not scored, not that it scored badly — CLAUDE.md's
-    unknown-is-not-fail rule. The caller renders
-    :data:`INSUFFICIENT_EVIDENCE` instead of a number.
-
-    Confidence is not an input and is never blended in.
-    """
-    usable = [r for r in ratings if isinstance(r, int) and not isinstance(r, bool)]
-    if not usable:
-        return None
-    mean = sum(usable) / len(usable)
-    return max(0, min(10, round(10.0 * mean / RATING_MAX)))
+# The Interview score is NOT derived in this module any more: Step 10b moved the
+# single derivation to ``final_scoring.compute_interview_score_all_rounds`` so the
+# scorecard and the final ranking can never disagree. See that module's docstring
+# for the formula and the rationale.
 
 
 # --- helpers ----------------------------------------------------------
@@ -478,6 +469,7 @@ def _bucket(
     provenance: str,
     *,
     unavailable_reason: str | None,
+    score_places: int = 0,
 ) -> ScorecardBucket:
     return ScorecardBucket(
         label=label,
@@ -486,6 +478,7 @@ def _bucket(
         evidence=tuple(evidence),
         provenance=provenance,
         unavailable_reason=unavailable_reason if score is None else None,
+        score_places=score_places,
     )
 
 
@@ -766,12 +759,34 @@ def get_final_scorecard(
         )
         for r in (getattr(latest_feedback, "ratings", None) or [])
     )
-    interview_score = compute_interview_score([r.rating for r in ratings])
-    interview_evidence = [
-        f"{r.competency_label}: {r.rating}/{r.rating_max}"
-        + (f" — {r.comment}" if r.comment else "")
-        for r in ratings
-    ]
+    # ALL rounds, every round equal (mean of round means) — the one derivation,
+    # shared with the final ranking. ``ratings`` above is only the latest round's
+    # detail block, which the page shows under "Human interview feedback".
+    ratings_by_round = {
+        f.interview_round: [r.rating for r in f.ratings] for f in feedback_history
+    }
+    round_means = interview_round_means(ratings_by_round)
+    interview_score = compute_interview_score_all_rounds(ratings_by_round)
+    rounds_unscored = tuple(sorted(r for r in ratings_by_round if r not in round_means))
+    interview_evidence: list[str] = []
+    for f in sorted(feedback_history, key=lambda x: x.interview_round):
+        if f.interview_round in round_means:
+            interview_evidence.append(
+                f"Round {f.interview_round}: mean "
+                f"{round_means[f.interview_round]:.2f}/{RATING_MAX} from "
+                f"{len(f.ratings)} rating(s)"
+            )
+            interview_evidence.extend(
+                f"Round {f.interview_round} · {r.competency_label}: "
+                f"{r.rating}/{RATING_MAX}"
+                + (f" — {r.comment}" if r.comment else "")
+                for r in f.ratings
+            )
+        else:
+            interview_evidence.append(
+                f"Round {f.interview_round}: no ratings recorded — not scored "
+                "(never counted as zero)"
+            )
     interview = _bucket(
         "Interview",
         interview_score,
@@ -779,9 +794,14 @@ def get_final_scorecard(
         interview_evidence,
         Provenance.SYSTEM_SCORE,
         unavailable_reason=(
-            INSUFFICIENT_EVIDENCE if latest_feedback is not None
+            INSUFFICIENT_EVIDENCE if feedback_history
             else "No interview feedback recorded yet"
         ),
+        score_places=2,
+    )
+
+    final_entry = get_final_ranking_for_application(
+        db, app_uuid, acting_user_id=acting_user_id
     )
 
     overall_unavailable = (
@@ -867,5 +887,24 @@ def get_final_scorecard(
         ),
         post_interview_read_latest_only=bool(
             getattr(analysis, "analyzed_only_latest_feedback", False)
+        ),
+        interview_rounds_used=tuple(sorted(round_means)),
+        interview_rounds_unscored=rounds_unscored,
+        final_ranking=(
+            ScorecardFinalRanking(
+                entry_status=final_entry.entry.entry_status,
+                status_reason=final_entry.entry.status_reason,
+                final_score=final_entry.entry.final_score,
+                screening_score=final_entry.entry.screening_score,
+                interview_score=final_entry.entry.interview_score,
+                rank=final_entry.entry.rank,
+                tied=final_entry.entry.tied,
+                ranked_count=final_entry.ranked_count,
+                final_confidence=final_entry.entry.final_confidence,
+                screening_weight=final_entry.screening_weight,
+                interview_weight=final_entry.interview_weight,
+                generated_at=final_entry.generated_at,
+            )
+            if final_entry is not None else None
         ),
     )

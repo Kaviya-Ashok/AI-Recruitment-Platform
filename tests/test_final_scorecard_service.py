@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import sys
 import itertools
 import pathlib
 import uuid
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -65,7 +67,6 @@ from app.services.final_scorecard_service import (
     MULTIPLE_RUBRIC_VERSIONS_WARNING,
     FinalScorecardActorError,
     Provenance,
-    compute_interview_score,
     get_final_scorecard,
 )
 from app.services.interview_feedback_service import create_interview_feedback
@@ -90,43 +91,21 @@ _NOTES = (
 
 
 # =====================================================================
-# Section 1 — the one derived score (no DB, no AI)
+# Section 1 -- the Interview score is no longer derived in this module
 # =====================================================================
+#
+# Step 10b moved the single derivation out of this service: the Interview score
+# is ``final_scoring.compute_interview_score_all_rounds`` (ALL rounds, every round
+# equal, 2 decimals half-up) so the scorecard and the final ranking cannot
+# disagree. The old pure tests of ``compute_interview_score`` (single round,
+# integer, banker's rounding) were REMOVED with the function; their cases live on,
+# updated for the new formula, in ``tests/test_final_scoring.py``.
 
 
-def test_interview_score_is_none_without_ratings():
-    """Notes-only feedback is legitimate; no ratings means "not scored", not
-    "scored zero" (CLAUDE.md — unknown is not fail)."""
-    assert compute_interview_score([]) is None
-    assert compute_interview_score([None, "x", True]) is None  # type: ignore[list-item]
+def test_the_old_single_round_derivation_is_gone_from_this_module():
+    import app.services.final_scorecard_service as module
 
-
-@pytest.mark.parametrize(
-    "ratings, expected",
-    [
-        ([5], 10),
-        ([5, 5, 5], 10),
-        ([1], 2),          # bottom of a 1-5 scale is 1/5, deliberately not 0
-        ([1, 1, 1], 2),
-        ([3], 6),
-        ([4, 3], 7),       # mean 3.5 -> 7.0
-        ([2, 5, 3, 1], 6),  # mean 2.75 -> 5.5 -> round -> 6
-    ],
-)
-def test_interview_score_formula(ratings, expected):
-    """score = round(10 * mean / RATING_MAX), clamped to [0, 10]."""
-    assert compute_interview_score(ratings) == expected
-
-
-def test_interview_score_always_in_range():
-    for combo in itertools.product(range(1, RATING_MAX + 1), repeat=3):
-        assert 0 <= compute_interview_score(list(combo)) <= 10
-
-
-def test_interview_score_takes_no_confidence_argument():
-    """CLAUDE.md §21 separation — confidence is never blended into a score."""
-    params = set(inspect.signature(compute_interview_score).parameters)
-    assert params == {"ratings"}
+    assert not hasattr(module, "compute_interview_score")
 
 
 # =====================================================================
@@ -591,12 +570,16 @@ def test_overall_score_is_the_existing_ranking_score(db):
 def test_interview_score_is_derived_from_the_recorded_ratings(db):
     s = _seed(db)   # ratings 4 and 3 -> mean 3.5 -> round(10*3.5/5) = 7
     v = _card(db, s)
-    assert v.interview.score == 7
+    # Step 10b: ALL rounds, 2 decimals (was the integer round(10*3.5/5) == 7).
+    assert v.interview.score == Decimal("7.00")
+    assert v.interview.score_places == 2
+    assert v.interview_rounds_used == (1,)
     # Order follows the feedback accessor's own competency-label ordering, so
-    # assert on content rather than position.
+    # assert on content rather than position. Lines are now per round.
     assert set(v.interview.evidence) == {
-        "System design: 4/5 — Clear trade-offs.",
-        "Communication: 3/5",
+        "Round 1: mean 3.50/5 from 2 rating(s)",
+        "Round 1 · System design: 4/5 — Clear trade-offs.",
+        "Round 1 · Communication: 3/5",
     }
 
 
@@ -895,14 +878,19 @@ def test_service_defines_no_disagreement_computation():
 
 
 def test_only_one_score_is_derived_here():
-    """compute_interview_score is the sole derivation; everything else is read
-    verbatim. Guards against a scoring methodology creeping in."""
+    """No score is derived IN this module any more: the Interview score is
+    imported from ``final_scoring`` (the single source of truth) and everything
+    else is read verbatim. Guards against a scoring methodology creeping in."""
     tree = _service_ast()
     computing = [
         n.name for n in tree.body
         if isinstance(n, ast.FunctionDef) and n.name.startswith("compute_")
     ]
-    assert computing == ["compute_interview_score"]
+    assert computing == []
+    src = inspect.getsource(sys.modules[
+        "app.services.final_scorecard_service"
+    ])
+    assert "compute_interview_score_all_rounds" in src      # imported, not defined
 
 
 def test_upstream_rows_are_untouched_by_assembly(db):

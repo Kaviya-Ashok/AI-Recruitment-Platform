@@ -416,11 +416,16 @@ def test_scorecard_flags_a_legacy_analysis():
     )
 
 
-def test_the_scorecards_interview_score_inputs_are_unchanged():
-    """The Interview score still derives from the latest feedback only (Step 10);
-    only the analysis disclosure line is new."""
+def test_the_scorecards_interview_score_now_uses_every_round():
+    """Step 10b reversed Step 10's latest-round-only Interview score: it is the
+    shared ``final_scoring`` function over ALL rounds. (This test previously
+    pinned the old ``compute_interview_score(ratings)`` signature.)"""
     import inspect
 
-    from app.services.final_scorecard_service import compute_interview_score
+    from app.services import final_scorecard_service as scorecard
+    from app.services.final_scoring import compute_interview_score_all_rounds
 
-    assert list(inspect.signature(compute_interview_score).parameters) == ["ratings"]
+    assert not hasattr(scorecard, "compute_interview_score")
+    assert list(inspect.signature(compute_interview_score_all_rounds).parameters) == [
+        "ratings_by_round"
+    ]
