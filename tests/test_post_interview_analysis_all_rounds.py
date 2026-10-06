@@ -1033,7 +1033,15 @@ def test_post_interview_service_is_the_only_analysis_service_that_imports_it():
     )
     # final_scorecard_service reads only the CURRENT transcript's file NAME
     # (Increment B); post_interview_service is the one that reads its text.
-    assert importers == ["final_scorecard_service.py", "post_interview_service.py"]
+    # job_workspace_service (HR UI Increment 3) COUNTS the CURRENT transcript rows
+    # for the candidate header and the Interviews table — id / status / feedback
+    # link only, pinned by tests/test_candidate_header_service.py; it never reads a
+    # file name, a Drive id or any text.
+    assert importers == [
+        "final_scorecard_service.py",
+        "job_workspace_service.py",
+        "post_interview_service.py",
+    ]
 
 
 def test_no_disagreement_logic_and_no_new_status_anywhere():

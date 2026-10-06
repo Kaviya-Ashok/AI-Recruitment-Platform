@@ -13,13 +13,24 @@ id:
                     details, JD analysis, requirements, rubric, application link)
 * Applicants     -> ``candidates._render_ranking_section`` and
                     ``candidates._render_applications_tab``
-* Shortlist      -> a new READ-ONLY table (name, screening rank, guide, rounds)
-* Interviews     -> ``interviews._render_shortlisted_section``
+* Shortlist      -> a READ-ONLY table (name, screening rank, guide, rounds)
+* Interviews     -> a READ-ONLY overview table (rounds, feedback, transcripts,
+                    AI analysis, decision) — the per-candidate work moved to the
+                    candidate page
 * Final ranking  -> ``interviews._render_final_ranking_section``
 
 so every existing behaviour, audit event, confirmation and permission check inside
 them is unchanged. (Those renderers already took ``job_id``; the old Candidates
 and Interviews pages still call them with the job picker's value.)
+
+CANDIDATE PAGE (Increment 3)
+----------------------------
+With ``&candidate=<application id>`` in the URL this module renders the candidate
+page (``app/pages/candidate_page.py``) instead of the workspace. The Shortlist and
+Interviews tables open it by row selection (``st.dataframe`` single-row
+``on_select``); Applicants and Final ranking carry a small "Open candidate page"
+selector at the top. ``stage`` stays in the URL, so closing the candidate returns to
+the stage it was opened from.
 
 LAZY BY CONSTRUCTION
 --------------------
@@ -53,11 +64,9 @@ import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.database import session_scope
+from app.pages.candidate_page import render_candidate_page
 from app.pages.candidates import _render_applications_tab, _render_ranking_section
-from app.pages.interviews import (
-    _render_final_ranking_section,
-    _render_shortlisted_section,
-)
+from app.pages.interviews import _render_final_ranking_section
 from app.pages.jobs import _job_view, _render_job_body
 from app.services.interview_feedback_service import list_feedback_views
 from app.services.interview_guide_service import get_shortlisted_candidates_for_job
@@ -68,12 +77,16 @@ from app.services.job_workspace_service import (
     JobStageSummary,
     default_stage,
     get_job_stage_summary,
+    list_interview_overview,
+    list_job_candidates,
 )
 from app.utils.authorization import UnauthorizedError
 from app.utils.ui import label_for, stage_label, status_kind
 from app.utils.ui_widgets import load_error, page_header
 from app.utils.workspace_nav import (
     close_workspace,
+    open_candidate,
+    requested_candidate,
     requested_job,
     requested_stage,
     set_stage,
@@ -131,6 +144,86 @@ def neighbours(stage: str) -> tuple[str | None, str | None]:
     return previous, following
 
 
+def selected_application_id(selected_rows, application_ids) -> str | None:
+    """The application id of the row a ``st.dataframe`` single-row selection
+    points at, or ``None`` (nothing selected, or an index outside the table).
+    Pure."""
+    rows = list(selected_rows or [])
+    if not rows:
+        return None
+    index = rows[0]
+    if not isinstance(index, int) or not 0 <= index < len(application_ids):
+        return None
+    return str(application_ids[index])
+
+
+def feedback_status_text(rounds: int, has_unrated_round: bool) -> str:
+    """The Interviews table's Feedback cell, in words. Pure."""
+    if rounds == 0:
+        return "None recorded"
+    if has_unrated_round:
+        return "Ratings missing"
+    return "Rated"
+
+
+def _candidate_option_label(candidate) -> str:
+    rank = (
+        f"screening rank #{candidate.screening_rank}"
+        if candidate.screening_rank is not None else "not ranked"
+    )
+    return f"{candidate.candidate_name} ({rank})"
+
+
+# --- opening a candidate -----------------------------------------------------------
+
+
+def _open_selected(widget_key: str) -> None:
+    """``on_change`` for the "Open candidate page" selector: point the URL at the
+    chosen application (callbacks run before the next run — no ``st.rerun()``)."""
+    chosen = st.session_state.get(widget_key)
+    if chosen:
+        open_candidate(chosen)
+
+
+def _candidate_selector(job_id: str, acting_user_id, *, scope: str) -> None:
+    """A small "Open candidate page" selectbox for the stages that keep their
+    reused sections (Applicants, Final ranking)."""
+    try:
+        with session_scope() as db:
+            candidates = list_job_candidates(
+                db, job_id, acting_user_id=acting_user_id
+            )
+    except UnauthorizedError:
+        st.error(_INACTIVE)
+        return
+    except SQLAlchemyError:
+        load_error("Couldn't load the candidate list right now.")
+        return
+    if not candidates:
+        return
+    labels = {str(c.application_id): _candidate_option_label(c) for c in candidates}
+    widget_key = f"ws_open_{scope}_{job_id}"
+    st.selectbox(
+        "Open candidate page",
+        list(labels),
+        index=None,
+        placeholder="Choose a candidate",
+        format_func=labels.__getitem__,
+        key=widget_key,
+        on_change=_open_selected,
+        args=(widget_key,),
+    )
+
+
+def _open_from_table(event, application_ids) -> None:
+    """If a table row is selected, open that candidate and rerun so the URL change
+    is picked up."""
+    target = selected_application_id(event.selection.rows, application_ids)
+    if target is not None:
+        open_candidate(target)
+        st.rerun()
+
+
 # --- stage bodies -------------------------------------------------------------
 
 
@@ -149,6 +242,7 @@ def _stage_setup(job_id: str, acting_user_id) -> None:
 
 
 def _stage_applicants(job_id: str, acting_user_id) -> None:
+    _candidate_selector(job_id, acting_user_id, scope="applicants")
     ranking_tab, applications_tab = st.tabs(["Ranking & Shortlist", "Applications"])
     with ranking_tab:
         _render_ranking_section(job_id, acting_user_id)
@@ -193,7 +287,7 @@ def _stage_shortlist(job_id: str, acting_user_id) -> None:
         )
         return
 
-    st.table(
+    event = st.dataframe(
         [
             {
                 "Candidate": r.candidate_name,
@@ -202,19 +296,71 @@ def _stage_shortlist(job_id: str, acting_user_id) -> None:
                 "Rounds recorded": rounds.get(r.application_id, 0),
             }
             for r in rows
-        ]
+        ],
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"ws_shortlist_table_{job_id}",
     )
     st.caption(
-        "Read-only. Adding or removing candidates is done in Applicants "
-        "(Ranking & Shortlist)."
+        "Select a row to open that candidate's page. Adding or removing "
+        "candidates is done in Applicants (Ranking & Shortlist)."
     )
+    _open_from_table(event, [r.application_id for r in rows])
 
 
 def _stage_interviews(job_id: str, acting_user_id) -> None:
-    _render_shortlisted_section(job_id, acting_user_id)
+    st.subheader("Interviews")
+    try:
+        with session_scope() as db:
+            rows = list_interview_overview(
+                db, job_id, acting_user_id=acting_user_id
+            )
+    except UnauthorizedError:
+        st.error(_INACTIVE)
+        return
+    except SQLAlchemyError:
+        load_error("Couldn't load the interviews right now.")
+        return
+
+    if not rows:
+        st.caption(
+            "No candidates are in the interview stage for this job yet. "
+            "Shortlisting is done in Applicants."
+        )
+        return
+
+    st.info(
+        "The interview guide, feedback, transcripts, AI analysis and the decision "
+        "for each person are on that candidate's page. This table is the overview."
+    )
+    event = st.dataframe(
+        [
+            {
+                "Candidate": r.candidate_name,
+                "Rounds": r.rounds_count,
+                "Feedback": feedback_status_text(r.rounds_count, r.has_unrated_round),
+                "Transcripts": r.transcripts_count,
+                "AI analysis": "Generated" if r.has_analysis else "Not generated",
+                "Final decision": (
+                    label_for(r.decision) if r.decision else "Not decided"
+                ),
+            }
+            for r in rows
+        ],
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"ws_interviews_table_{job_id}",
+    )
+    st.caption("Select a row to open that candidate's page.")
+    _open_from_table(event, [r.application_id for r in rows])
 
 
 def _stage_final_ranking(job_id: str, acting_user_id) -> None:
+    _candidate_selector(job_id, acting_user_id, scope="final_ranking")
     _render_final_ranking_section(job_id, acting_user_id)
 
 
@@ -257,6 +403,11 @@ def render_job_workspace(acting_user_id: uuid.UUID | None) -> None:
     """Render the workspace for the ``?job=`` in the URL."""
     if acting_user_id is None:
         st.error(_SESSION_INVALID)
+        return
+
+    # ``&candidate=`` turns the workspace into that application's page.
+    if requested_candidate() is not None:
+        render_candidate_page(acting_user_id)
         return
 
     job_param = requested_job()

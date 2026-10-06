@@ -6,6 +6,19 @@ change, no new table. Every number is a COUNT over rows earlier steps already
 stored; nothing is scored, ranked or inferred here, and no candidate name, note or
 free text is read at all.
 
+INCREMENT 3 — THE CANDIDATE PAGE
+--------------------------------
+Four more readers sit below the stage summary, under the same guard and the same
+rules: :func:`get_candidate_header` (one application's headline facts),
+:func:`list_job_candidates` (the Prev/Next order and the "Open candidate page"
+selector), :func:`list_interview_overview` (the Interviews stage table) and
+:func:`list_candidate_activity` (event label, time and actor — never an audit
+row's metadata, state snapshots or free-text ``action``). They read STORED scores
+and ranks exactly as earlier steps wrote them; nothing is recomputed. The first
+reads the candidate's header in a handful of point queries on purpose — the final
+scorecard assembly makes dozens, which is far too much for a strip that sits above
+every tab.
+
 GUARD
 -----
 The closest read-accessor precedent is ``final_ranking_service.get_current_final_ranking``
@@ -42,21 +55,43 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
 from app.database.models.application import Application
+from app.database.models.audit_event import AuditEvent
+from app.database.models.candidate import Candidate
 from app.database.models.candidate_ranking import CandidateRanking
 from app.database.models.candidate_shortlist_entry import CandidateShortlistEntry
 from app.database.models.document import Document
 from app.database.models.final_decision import FinalDecision, FinalDecisionStatus
+from app.database.models.final_ranking import (
+    FinalRanking,
+    FinalRankingEntry,
+    FinalRankingEntryStatus,
+    FinalRankingStatus,
+)
 from app.database.models.interview_feedback import (
     InterviewFeedback,
     InterviewFeedbackRating,
 )
+from app.database.models.interview_guide import InterviewGuide
+from app.database.models.interview_transcript import (
+    InterviewTranscript,
+    InterviewTranscriptStatus,
+)
 from app.database.models.job import Job
+from app.database.models.post_interview_analysis import (
+    PostInterviewAnalysis,
+    PostInterviewAnalysisStatus,
+)
 from app.database.models.rubric import RubricVersion, RubricVersionStatus
+from app.database.models.screening_evaluation import ScreeningEvaluation
+from app.database.models.screening_session import ScreeningSession
+from app.database.models.user import User
 from app.utils.authorization import require_internal_user
 
 #: Stage keys, in workspace order. They are the values written to the URL's
@@ -237,3 +272,452 @@ def get_job_stage_summary(
         ),
         interviewed_count=len(interviewed),
     )
+
+
+# --- Increment 3: the candidate page -----------------------------------------------
+
+#: Most activity rows the candidate Overview shows (newest first).
+ACTIVITY_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class CandidateHeader:
+    """Headline facts for one application of one job — everything the candidate
+    page's header, summary strip, Progress and Next step need. Frozen primitives
+    only, so it can be built inside ``session_scope()`` and used after the session
+    closes."""
+
+    application_id: uuid.UUID
+    job_id: uuid.UUID
+    candidate_name: str
+    candidate_email: str
+    job_code: str
+    job_title: str
+    application_status: str
+    #: A screening evaluation's overall score exists for this application.
+    screened: bool
+    is_shortlisted: bool
+    #: Screening score (0-10) and rank, as stored. When a CURRENT final ranking
+    #: has this application the snapshot it recorded is used; otherwise the latest
+    #: screening-ranking row.
+    screening_score: Decimal | None
+    screening_rank: int | None
+    interview_score: Decimal | None
+    final_score: Decimal | None
+    final_rank: int | None
+    #: How many candidates the CURRENT final ranking ranks (for "of N ranked").
+    final_ranked_count: int | None
+    #: A ``FinalRankingEntryStatus`` value, or ``None`` with no CURRENT final ranking.
+    entry_status: str | None
+    entry_reason: str | None
+    has_current_final_ranking: bool
+    has_analysis: bool
+    rounds_count: int
+    #: At least one round has no competency ratings (notes only).
+    has_unrated_round: bool
+    #: CURRENT transcripts (a replaced version is not counted).
+    transcripts_count: int
+    #: The CURRENT final decision, if any.
+    decision: str | None
+    decided_by_name: str | None
+    decided_at: datetime | None
+
+
+@dataclass(frozen=True)
+class JobCandidate:
+    """One application of a job, in the order the Prev/Next switcher walks."""
+
+    application_id: uuid.UUID
+    candidate_name: str
+    screening_rank: int | None
+
+
+@dataclass(frozen=True)
+class InterviewOverviewRow:
+    """One row of the workspace's Interviews table."""
+
+    application_id: uuid.UUID
+    candidate_name: str
+    rounds_count: int
+    has_unrated_round: bool
+    transcripts_count: int
+    has_analysis: bool
+    decision: str | None
+
+
+@dataclass(frozen=True)
+class ActivityItem:
+    """One audit event, reduced to what a reader needs: what, when, who."""
+
+    event_type: str
+    timestamp: datetime
+    actor_name: str | None
+
+
+def _dec(value) -> Decimal | None:
+    return None if value is None else Decimal(str(value))
+
+
+def get_candidate_header(
+    db: Session,
+    job_id: uuid.UUID | str,
+    application_id: uuid.UUID | str,
+    *,
+    acting_user_id: uuid.UUID | str,
+) -> CandidateHeader | None:
+    """The header facts for one application, or ``None`` when there is no such
+    application OR it does not belong to ``job_id`` (a malformed id counts as
+    none). HR/INTERNAL ONLY; read-only.
+
+    Query budget: the guard, one joined read (with correlated counts) for the
+    application, the CURRENT final-ranking entry (plus, only when it is ranked,
+    one count), the latest screening-ranking row (only when no final entry
+    supplies the screening snapshot), and the CURRENT decision — at most six.
+
+    Raises
+    ------
+    UnauthorizedError
+        ``acting_user_id`` is missing, unknown or inactive.
+    """
+    require_internal_user(db, acting_user_id)
+
+    job_uuid = _as_uuid(job_id)
+    app_uuid = _as_uuid(application_id)
+    if job_uuid is None or app_uuid is None:
+        return None
+
+    rounds_q = (
+        select(func.count(InterviewFeedback.id))
+        .where(InterviewFeedback.application_id == Application.id)
+        .scalar_subquery()
+    )
+    unrated_q = (
+        select(func.count(InterviewFeedback.id))
+        .where(
+            InterviewFeedback.application_id == Application.id,
+            ~exists().where(
+                InterviewFeedbackRating.interview_feedback_id == InterviewFeedback.id
+            ),
+        )
+        .scalar_subquery()
+    )
+    transcripts_q = (
+        select(func.count(InterviewTranscript.id))
+        .join(
+            InterviewFeedback,
+            InterviewFeedback.id == InterviewTranscript.interview_feedback_id,
+        )
+        .where(
+            InterviewFeedback.application_id == Application.id,
+            InterviewTranscript.status == InterviewTranscriptStatus.CURRENT,
+        )
+        .scalar_subquery()
+    )
+    analysis_q = exists().where(
+        PostInterviewAnalysis.application_id == Application.id,
+        PostInterviewAnalysis.status == PostInterviewAnalysisStatus.CURRENT,
+    )
+    shortlisted_q = exists().where(
+        CandidateShortlistEntry.application_id == Application.id,
+        CandidateShortlistEntry.is_shortlisted.is_(True),
+    )
+    screened_q = exists().where(
+        ScreeningSession.application_id == Application.id,
+        ScreeningSession.id.in_(
+            select(ScreeningEvaluation.screening_session_id)
+        ),
+    )
+
+    row = db.execute(
+        select(
+            Application.status,
+            Candidate.full_name,
+            Candidate.email,
+            Job.job_code,
+            Job.title,
+            rounds_q,
+            unrated_q,
+            transcripts_q,
+            analysis_q,
+            shortlisted_q,
+            screened_q,
+        )
+        .join(Candidate, Candidate.id == Application.candidate_id)
+        .join(Job, Job.id == Application.job_id)
+        .where(Application.id == app_uuid, Application.job_id == job_uuid)
+    ).first()
+    if row is None:
+        return None
+    (
+        status, name, email, code, title, rounds, unrated, transcripts,
+        has_analysis, shortlisted, screened,
+    ) = row
+
+    final = db.execute(
+        select(FinalRankingEntry, FinalRanking.id)
+        .join(FinalRanking, FinalRanking.id == FinalRankingEntry.final_ranking_id)
+        .where(
+            FinalRankingEntry.application_id == app_uuid,
+            FinalRanking.status == FinalRankingStatus.CURRENT,
+        )
+        .order_by(FinalRanking.created_at.desc(), FinalRanking.id.desc())
+        .limit(1)
+    ).first()
+
+    entry = final[0] if final is not None else None
+    ranked_count = None
+    if entry is not None and entry.rank is not None:
+        ranked_count = db.execute(
+            select(func.count(FinalRankingEntry.id)).where(
+                FinalRankingEntry.final_ranking_id == final[1],
+                FinalRankingEntry.entry_status == FinalRankingEntryStatus.RANKED,
+            )
+        ).scalar_one()
+
+    if entry is not None:
+        screening_score = _dec(entry.screening_score)
+        screening_rank = entry.screening_rank
+    else:
+        ranking = db.execute(
+            select(CandidateRanking.overall_score, CandidateRanking.rank_position)
+            .where(CandidateRanking.application_id == app_uuid)
+            .order_by(CandidateRanking.generated_at.desc())
+            .limit(1)
+        ).first()
+        screening_score = _dec(ranking[0]) if ranking is not None else None
+        screening_rank = ranking[1] if ranking is not None else None
+
+    decision = db.execute(
+        select(FinalDecision.decision, FinalDecision.created_at, User.full_name)
+        .outerjoin(User, User.id == FinalDecision.decided_by_user_id)
+        .where(
+            FinalDecision.application_id == app_uuid,
+            FinalDecision.status == FinalDecisionStatus.CURRENT,
+        )
+        .limit(1)
+    ).first()
+
+    return CandidateHeader(
+        application_id=app_uuid,
+        job_id=job_uuid,
+        candidate_name=name,
+        candidate_email=email,
+        job_code=code,
+        job_title=title,
+        application_status=status,
+        screened=bool(screened),
+        is_shortlisted=bool(shortlisted),
+        screening_score=screening_score,
+        screening_rank=screening_rank,
+        interview_score=_dec(entry.interview_score) if entry is not None else None,
+        final_score=_dec(entry.final_score) if entry is not None else None,
+        final_rank=entry.rank if entry is not None else None,
+        final_ranked_count=ranked_count,
+        entry_status=entry.entry_status if entry is not None else None,
+        entry_reason=entry.status_reason if entry is not None else None,
+        has_current_final_ranking=entry is not None,
+        has_analysis=bool(has_analysis),
+        rounds_count=int(rounds or 0),
+        has_unrated_round=bool(unrated),
+        transcripts_count=int(transcripts or 0),
+        decision=decision[0] if decision is not None else None,
+        decided_by_name=(decision[2] or "—") if decision is not None else None,
+        decided_at=decision[1] if decision is not None else None,
+    )
+
+
+def list_job_candidates(
+    db: Session,
+    job_id: uuid.UUID | str,
+    *,
+    acting_user_id: uuid.UUID | str,
+) -> list[JobCandidate]:
+    """Every application of the job, ordered for the Prev/Next switcher: screening
+    rank ascending (unranked last), then earliest applied, then id (a stable
+    tie-break). Empty for an unknown or malformed job. HR/INTERNAL ONLY; read-only.
+
+    The rank is the application's latest screening-ranking row, as stored.
+    """
+    require_internal_user(db, acting_user_id)
+    job_uuid = _as_uuid(job_id)
+    if job_uuid is None:
+        return []
+
+    apps = db.execute(
+        select(Application.id, Candidate.full_name, Application.created_at)
+        .join(Candidate, Candidate.id == Application.candidate_id)
+        .where(Application.job_id == job_uuid)
+    ).all()
+    if not apps:
+        return []
+
+    latest: dict[uuid.UUID, int | None] = {}
+    for app_id, rank in db.execute(
+        select(CandidateRanking.application_id, CandidateRanking.rank_position)
+        .where(CandidateRanking.job_id == job_uuid)
+        .order_by(CandidateRanking.generated_at.asc())
+    ).all():
+        latest[app_id] = rank        # ascending by time, so the newest row wins
+
+    rows = [
+        JobCandidate(app_id, name, latest.get(app_id))
+        for app_id, name, _created in apps
+    ]
+    created = {app_id: c for app_id, _n, c in apps}
+    rows.sort(
+        key=lambda r: (
+            r.screening_rank is None,
+            r.screening_rank or 0,
+            created[r.application_id],
+            str(r.application_id),
+        )
+    )
+    return rows
+
+
+def list_interview_overview(
+    db: Session,
+    job_id: uuid.UUID | str,
+    *,
+    acting_user_id: uuid.UUID | str,
+) -> list[InterviewOverviewRow]:
+    """One row per application of the job that is in the interview stage — shortlisted
+    now, holding an interview guide, or with at least one recorded round — in the
+    Prev/Next order. HR/INTERNAL ONLY; read-only; set-based (no per-row queries)."""
+    require_internal_user(db, acting_user_id)
+    job_uuid = _as_uuid(job_id)
+    if job_uuid is None:
+        return []
+    candidates = list_job_candidates(db, job_uuid, acting_user_id=acting_user_id)
+    if not candidates:
+        return []
+
+    job_apps = select(Application.id).where(Application.job_id == job_uuid)
+
+    rounds: dict[uuid.UUID, int] = {}
+    unrated: dict[uuid.UUID, bool] = {}
+    for app_id, rating_count in db.execute(
+        select(InterviewFeedback.application_id, func.count(InterviewFeedbackRating.id))
+        .outerjoin(
+            InterviewFeedbackRating,
+            InterviewFeedbackRating.interview_feedback_id == InterviewFeedback.id,
+        )
+        .where(InterviewFeedback.application_id.in_(job_apps))
+        .group_by(InterviewFeedback.id, InterviewFeedback.application_id)
+    ).all():
+        rounds[app_id] = rounds.get(app_id, 0) + 1
+        if rating_count == 0:
+            unrated[app_id] = True
+
+    transcripts = dict(
+        db.execute(
+            select(InterviewFeedback.application_id, func.count(InterviewTranscript.id))
+            .join(
+                InterviewTranscript,
+                InterviewTranscript.interview_feedback_id == InterviewFeedback.id,
+            )
+            .where(
+                InterviewFeedback.application_id.in_(job_apps),
+                InterviewTranscript.status == InterviewTranscriptStatus.CURRENT,
+            )
+            .group_by(InterviewFeedback.application_id)
+        ).all()
+    )
+    analysed = set(
+        db.execute(
+            select(PostInterviewAnalysis.application_id).where(
+                PostInterviewAnalysis.application_id.in_(job_apps),
+                PostInterviewAnalysis.status == PostInterviewAnalysisStatus.CURRENT,
+            )
+        ).scalars().all()
+    )
+    decisions = dict(
+        db.execute(
+            select(FinalDecision.application_id, FinalDecision.decision).where(
+                FinalDecision.application_id.in_(job_apps),
+                FinalDecision.status == FinalDecisionStatus.CURRENT,
+            )
+        ).all()
+    )
+    shortlisted = set(
+        db.execute(
+            select(CandidateShortlistEntry.application_id).where(
+                CandidateShortlistEntry.job_id == job_uuid,
+                CandidateShortlistEntry.is_shortlisted.is_(True),
+            )
+        ).scalars().all()
+    )
+    with_guide = set(
+        db.execute(
+            select(InterviewGuide.application_id).where(
+                InterviewGuide.job_id == job_uuid
+            )
+        ).scalars().all()
+    )
+
+    return [
+        InterviewOverviewRow(
+            application_id=c.application_id,
+            candidate_name=c.candidate_name,
+            rounds_count=rounds.get(c.application_id, 0),
+            has_unrated_round=unrated.get(c.application_id, False),
+            transcripts_count=transcripts.get(c.application_id, 0),
+            has_analysis=c.application_id in analysed,
+            decision=decisions.get(c.application_id),
+        )
+        for c in candidates
+        if c.application_id in shortlisted
+        or c.application_id in with_guide
+        or c.application_id in rounds
+    ]
+
+
+def list_candidate_activity(
+    db: Session,
+    application_id: uuid.UUID | str,
+    *,
+    acting_user_id: uuid.UUID | str,
+    limit: int = ACTIVITY_LIMIT,
+) -> list[ActivityItem]:
+    """Audit events about one application — newest first — as (event type, time,
+    actor name). Events are found STRUCTURALLY, by what they point at: the
+    application itself, its résumé documents, its screening session and its
+    interview transcripts. This reads ONLY ``event_type``, ``timestamp`` and the
+    actor's name; an event's ``action`` sentence, metadata and state snapshots are
+    never selected. HR/INTERNAL ONLY; read-only.
+    """
+    require_internal_user(db, acting_user_id)
+    app_uuid = _as_uuid(application_id)
+    if app_uuid is None:
+        return []
+
+    own = (AuditEvent.entity_type == "application") & (
+        AuditEvent.entity_id == app_uuid
+    )
+    documents = (AuditEvent.entity_type == "document") & AuditEvent.entity_id.in_(
+        select(Document.id).where(Document.application_id == app_uuid)
+    )
+    sessions = (
+        AuditEvent.entity_type == "screening_session"
+    ) & AuditEvent.entity_id.in_(
+        select(ScreeningSession.id).where(ScreeningSession.application_id == app_uuid)
+    )
+    transcripts = (
+        AuditEvent.entity_type == "interview_transcript"
+    ) & AuditEvent.entity_id.in_(
+        select(InterviewTranscript.id)
+        .join(
+            InterviewFeedback,
+            InterviewFeedback.id == InterviewTranscript.interview_feedback_id,
+        )
+        .where(InterviewFeedback.application_id == app_uuid)
+    )
+
+    rows = db.execute(
+        select(AuditEvent.event_type, AuditEvent.timestamp, User.full_name)
+        .outerjoin(User, User.id == AuditEvent.user_id)
+        .where(own | documents | sessions | transcripts)
+        .order_by(AuditEvent.timestamp.desc(), AuditEvent.id.desc())
+        .limit(limit)
+    ).all()
+    return [ActivityItem(t, ts, who) for t, ts, who in rows]

@@ -211,6 +211,55 @@ _RATING_SLOTS = 5
 # --- loaders (thin) -----------------------------------------------
 
 
+def _load_feedback_state(db, application_id, acting_user_id) -> dict:
+    """One application's interview-feedback state: context, history and every
+    transcript version. Extracted unchanged from :func:`_load_view` so the
+    candidate page can load just this for one application."""
+    history = list_feedback_views(db, application_id, acting_user_id=acting_user_id)
+    return {
+        "context": get_feedback_context(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+        "history": history,
+        # {feedback_id: [every transcript version, newest first]}
+        "transcripts": {
+            item.feedback_id: list_transcripts_for_feedback(
+                db, item.feedback_id, acting_user_id=acting_user_id
+            )
+            for item in history
+        },
+    }
+
+
+def _load_analysis_state(db, application_id, acting_user_id) -> dict:
+    """One application's post-interview analysis: current + history. Reading is a
+    plain SELECT — no AI call happens on page load (CLAUDE.md §§9, 29)."""
+    return {
+        "current": get_current_post_interview_analysis(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+        "history": get_post_interview_analysis_history(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+    }
+
+
+def _load_decision_state(db, application_id, acting_user_id) -> dict:
+    """Step 11: one application's final human decision, its history and whether it
+    rests on earlier evidence. Plain SELECTs — nothing is written on page load."""
+    return {
+        "current": get_current_final_decision(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+        "history": list_final_decision_history(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+        "staleness": get_final_decision_staleness(
+            db, application_id, acting_user_id=acting_user_id
+        ),
+    }
+
+
 def _load_view(job_id: str, acting_user_id) -> dict:
     with session_scope() as db:
         shortlisted = get_shortlisted_candidates_for_job(
@@ -225,51 +274,16 @@ def _load_view(job_id: str, acting_user_id) -> dict:
         application_ids = {r.application_id for r in shortlisted} | {
             g.application_id for g in guides
         }
-        feedback = {}
-        for app_id in application_ids:
-            history = list_feedback_views(
-                db, app_id, acting_user_id=acting_user_id
-            )
-            feedback[app_id] = {
-                "context": get_feedback_context(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-                "history": history,
-                # {feedback_id: [every transcript version, newest first]}
-                "transcripts": {
-                    item.feedback_id: list_transcripts_for_feedback(
-                        db, item.feedback_id, acting_user_id=acting_user_id
-                    )
-                    for item in history
-                },
-            }
-        # Post-interview analyses for the same applications. Reading is a
-        # plain SELECT — no AI call happens on page load (CLAUDE.md §§9, 29).
-        analyses = {
-            app_id: {
-                "current": get_current_post_interview_analysis(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-                "history": get_post_interview_analysis_history(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-            }
+        feedback = {
+            app_id: _load_feedback_state(db, app_id, acting_user_id)
             for app_id in application_ids
         }
-        # Step 11: the final human decision, its history and whether it rests on
-        # earlier evidence. Plain SELECTs — nothing is written on page load.
+        analyses = {
+            app_id: _load_analysis_state(db, app_id, acting_user_id)
+            for app_id in application_ids
+        }
         decisions = {
-            app_id: {
-                "current": get_current_final_decision(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-                "history": list_final_decision_history(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-                "staleness": get_final_decision_staleness(
-                    db, app_id, acting_user_id=acting_user_id
-                ),
-            }
+            app_id: _load_decision_state(db, app_id, acting_user_id)
             for app_id in application_ids
         }
         # primitives / frozen dataclasses only — safe outside the session
@@ -1509,6 +1523,26 @@ def _str_list_block(title: str, items, provenance: str, empty: str) -> None:
         st.markdown(f"- {item}")
 
 
+def _render_screening_transcript(entries, question_count: int) -> None:
+    """The "Screening transcript (N questions)" expander: each question with the
+    candidate's answer as stored. Extracted unchanged from
+    :func:`_render_final_scorecard` so the candidate page's Screening tab shows the
+    same block. ``entries`` need ``round``, ``category``, ``question_text``,
+    ``answered`` and ``answer_text``."""
+    with st.expander(
+        f"Screening transcript ({question_count} question"
+        f"{'s' if question_count != 1 else ''})",
+        expanded=False,
+    ):
+        for entry in entries:
+            st.markdown(f"**Round {entry.round} · {label_for(entry.category)}**")
+            st.markdown(entry.question_text)
+            if entry.answered:
+                st.markdown(f"> {entry.answer_text}")
+            else:
+                st.caption("(not answered)")
+
+
 def _render_final_scorecard(view) -> None:
     """The whole §10 scorecard, ordered Evidence -> AI assessment -> Human
     feedback -> System scores -> Recommendations -> Final decision.
@@ -1604,20 +1638,9 @@ def _render_final_scorecard(view) -> None:
 
     st.caption(f"Source: {Provenance.SCREENING_TRANSCRIPT}")
     if view.has_screening_transcript:
-        _n = view.screening_question_count
-        with st.expander(
-            f"Screening transcript ({_n} question{'s' if _n != 1 else ''})",
-            expanded=False,
-        ):
-            for entry in view.screening_transcript:
-                st.markdown(
-                    f"**Round {entry.round} · {label_for(entry.category)}**"
-                )
-                st.markdown(entry.question_text)
-                if entry.answered:
-                    st.markdown(f"> {entry.answer_text}")
-                else:
-                    st.caption("(not answered)")
+        _render_screening_transcript(
+            view.screening_transcript, view.screening_question_count
+        )
     else:
         st.caption("No screening transcript is available for this candidate yet.")
 
@@ -1915,15 +1938,14 @@ def _decision_badge(decision: str) -> str:
     )
 
 
-def _render_final_decision_section(
-    application_id, decision_state, acting_user_id
-) -> None:
-    """The per-candidate "Final human decision" block (CLAUDE.md §11).
-
-    Shows the current decision (label + who + when + rationale), whether it rests
-    on earlier evidence, earlier decisions, and — for a hiring manager or admin —
-    the form to record or change it. Everyone else sees it read-only.
-    """
+def _render_final_decision_record(application_id, decision_state):
+    """The read-only half of the "Final human decision" block: heading, current
+    decision (label + who + when + rationale), the "based on earlier evidence"
+    warning and the earlier decisions. Returns ``(available, current)`` —
+    ``available`` is False when there is no decision state to show, in which case
+    nothing below the heading was drawn. Extracted unchanged from
+    :func:`_render_final_decision_section` so the candidate page's Decision tab
+    shows the same record."""
     state = (decision_state or {}).get(application_id) or {}
     current = state.get("current")
     history = state.get("history") or []
@@ -1937,7 +1959,7 @@ def _render_final_decision_section(
 
     if not state:
         st.caption("Decision details are not available for this candidate.")
-        return
+        return False, None
 
     if current is None:
         st.caption("No final decision has been recorded yet.")
@@ -1974,15 +1996,43 @@ def _render_final_decision_section(
                 )
                 st.markdown(h.rationale)
                 st.divider()
+    return True, current
+
+
+_DECISION_READ_ONLY_NOTE = (
+    "Only a hiring manager or an admin can record the final decision. "
+    "You can read it here."
+)
+
+
+def _render_final_decision_section(
+    application_id, decision_state, acting_user_id
+) -> None:
+    """The per-candidate "Final human decision" block (CLAUDE.md §11).
+
+    Shows the current decision (label + who + when + rationale), whether it rests
+    on earlier evidence, earlier decisions, and — for a hiring manager or admin —
+    the form to record or change it. Everyone else sees it read-only.
+    """
+    available, current = _render_final_decision_record(
+        application_id, decision_state
+    )
+    if not available:
+        return
 
     role = (get_current_user(st.session_state) or {}).get("role")
     if not role_may_decide(role):
-        st.info(
-            "Only a hiring manager or an admin can record the final decision. "
-            "You can read it here."
-        )
+        st.info(_DECISION_READ_ONLY_NOTE)
         return
 
+    _render_decision_form(application_id, current, acting_user_id)
+
+
+def _render_decision_form(application_id, current, acting_user_id) -> None:
+    """The Record / Change decision form: same fields, validation messages,
+    confirmation checkbox and service call wherever it is shown (inline on the
+    Interviews page, or inside the candidate page's dialog). The caller has
+    already checked the role."""
     app_id = str(application_id)
     version = st.session_state.get(f"fd_ver_{app_id}", 0)
     st.markdown("**Change the decision**" if current else "**Record the decision**")
@@ -2075,6 +2125,26 @@ def _render_final_scorecard_section(application_id, acting_user_id) -> None:
         _render_final_scorecard(view)
 
 
+def _render_guide_controls(
+    application_id, guide, guide_exists: bool, acting_user_id
+) -> None:
+    """The Generate / Regenerate button and the guide expander for one
+    SHORTLISTED candidate. Extracted unchanged from :func:`_render_candidate_row`
+    so the candidate page's Interview tab runs the same code."""
+    label = (
+        "Regenerate interview guide" if guide_exists
+        else "Generate interview guide"
+    )
+    if st.button(label, key=f"guide_{application_id}"):
+        _run_generate_guide(
+            str(application_id), acting_user_id, force=guide_exists
+        )
+
+    if guide is not None:
+        with st.expander("Interview guide", expanded=not guide_exists):
+            _render_guide(guide)
+
+
 def _render_candidate_row(
     row, guide, feedback_state, analysis_state, acting_user_id,
     decision_state=None,
@@ -2111,18 +2181,9 @@ def _render_candidate_row(
     if row.shortlist_reason:
         st.caption(f"HR note: {row.shortlist_reason}")
 
-    label = (
-        "Regenerate interview guide" if row.guide_exists
-        else "Generate interview guide"
+    _render_guide_controls(
+        row.application_id, guide, row.guide_exists, acting_user_id
     )
-    if st.button(label, key=f"guide_{row.application_id}"):
-        _run_generate_guide(
-            str(row.application_id), acting_user_id, force=row.guide_exists
-        )
-
-    if guide is not None:
-        with st.expander("Interview guide", expanded=not row.guide_exists):
-            _render_guide(guide)
     _render_feedback_section(row.application_id, feedback_state, acting_user_id)
     _render_analysis_section(
         row.application_id, feedback_state, analysis_state, acting_user_id

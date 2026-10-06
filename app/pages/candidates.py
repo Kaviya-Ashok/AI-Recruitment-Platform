@@ -36,6 +36,7 @@ import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.database import session_scope
+from app.database.models.application import Application
 from app.database.models.candidate import Candidate
 from app.database.models.screening_evaluation import ScreeningEvaluationBucket
 from app.services.application_service import (
@@ -172,22 +173,45 @@ def _load_application_summaries(
         out: list[dict] = []
         for app in list_applications_for_job(db, job_id, limit=limit):
             candidate = db.get(Candidate, app.candidate_id)
-            stall = stalled.get(str(app.id))
-            out.append(
-                {
-                    "application_id": str(app.id),
-                    "status": app.status,
-                    "candidate_name": candidate.full_name if candidate else "—",
-                    "candidate_email": candidate.email if candidate else "—",
-                    # None | "PRE_ROUND_1" | "MID_SCREENING"
-                    "screening_stall_kind": (
-                        None
-                        if stall is None
-                        else ("PRE_ROUND_1" if stall.is_pre_round_1 else "MID_SCREENING")
-                    ),
-                }
-            )
+            out.append(_summary_row(app, candidate, stalled.get(str(app.id))))
         return out, total
+
+
+def _summary_row(app, candidate, stall) -> dict:
+    """One application's card-label facts. Extracted unchanged from
+    :func:`_load_application_summaries` so the candidate page's Screening tab builds
+    the identical row for a single application."""
+    return {
+        "application_id": str(app.id),
+        "status": app.status,
+        "candidate_name": candidate.full_name if candidate else "—",
+        "candidate_email": candidate.email if candidate else "—",
+        # None | "PRE_ROUND_1" | "MID_SCREENING"
+        "screening_stall_kind": (
+            None
+            if stall is None
+            else ("PRE_ROUND_1" if stall.is_pre_round_1 else "MID_SCREENING")
+        ),
+    }
+
+
+def _load_application_summary(application_id: str, acting_user_id) -> dict | None:
+    """The :func:`_summary_row` for ONE application (``None`` if it does not
+    exist) — what a collapsed card shows, which :func:`_render_application_body`
+    also needs (status, stall kind). Read-only."""
+    app_uuid = uuid.UUID(application_id)
+    with session_scope() as db:
+        app = db.get(Application, app_uuid)
+        if app is None:
+            return None
+        candidate = db.get(Candidate, app.candidate_id)
+        stalled = {
+            str(sa.application_id): sa
+            for sa in list_stalled_screening_applications(
+                db, acting_user_id=acting_user_id
+            )
+        }
+        return _summary_row(app, candidate, stalled.get(str(app.id)))
 
 
 def _load_application_detail(application_id: str, acting_user_id) -> dict:
