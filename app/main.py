@@ -37,7 +37,6 @@ from app.database.database import session_scope
 from app.database.models.user import UserRole
 from app.pages.candidates_list import render_candidates_list_page
 from app.pages.dashboard import render_dashboard_page
-from app.pages.interviews import render_interviews_page
 from app.pages.jobs import render_jobs_page
 from app.pages.users import render_users_page
 from app.services.auth_service import authenticate_user
@@ -133,12 +132,6 @@ _PAGES: dict[str, st.Page] = {
         title="Candidates",
         icon=":material/group:",
         url_path="candidates",
-    ),
-    "interviews": st.Page(
-        render_interviews_page,
-        title="Interviews",
-        icon=":material/forum:",
-        url_path="interviews",
     ),
 }
 

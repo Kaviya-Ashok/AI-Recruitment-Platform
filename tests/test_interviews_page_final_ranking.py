@@ -17,7 +17,6 @@ import app.pages.interviews as I
 _TIMEOUT = 60
 
 _PATCHED_ATTRS = (
-    "_load_view", "load_job_options", "_render_shortlisted_section",
     "_load_final_ranking_view", "_run_generate_final_ranking",
 )
 _PRISTINE = {name: getattr(I, name) for name in _PATCHED_ATTRS}

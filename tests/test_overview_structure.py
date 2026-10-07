@@ -88,9 +88,9 @@ def _nav(role: str) -> list[tuple[str, str]]:
 
 
 @pytest.mark.parametrize("role", ["HR", "HIRING_MANAGER", "ADMIN"])
-def test_every_internal_role_sees_the_four_main_pages_in_order(role):
+def test_every_internal_role_sees_the_three_main_pages_in_order(role):
     titles = [t for t, _ in _nav(role) if t != "Users"]
-    assert titles == ["Dashboard", "Jobs", "Candidates", "Interviews"]
+    assert titles == ["Dashboard", "Jobs", "Candidates"]
 
 
 def test_users_stays_admin_only():
@@ -105,11 +105,12 @@ def test_the_candidates_entry_is_the_new_cross_job_list_not_the_old_page():
     assert "app.pages.candidates_list" in imports and "app.pages.dashboard" in imports
     assert "app.pages.candidates" not in imports                    # the old entry is gone
     assert not any(n.endswith("render_candidates_page") for n in imports)
+    assert not any(n.startswith("app.pages.interviews") for n in imports)
 
     pages = next(n for n in ast.walk(tree)
                  if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "_PAGES")
     by_key = {k.value: v for k, v in zip(pages.value.keys, pages.value.values)}
-    assert list(by_key) == ["dashboard", "jobs", "candidates", "interviews"]
+    assert list(by_key) == ["dashboard", "jobs", "candidates"]
     assert ast.unparse(by_key["candidates"].args[0]) == "_candidates_page"
     assert ast.unparse(by_key["dashboard"].args[0]) == "_dashboard_page"
 
@@ -122,17 +123,31 @@ def test_the_old_candidates_module_and_its_renderers_remain_for_the_applicants_s
     import app.pages.candidates as old
     import app.pages.job_workspace as workspace
 
-    for name in ("render_candidates_page", "_render_ranking_section",
-                 "_render_applications_tab", "_render_application_body"):
+    for name in ("_render_ranking_section", "_render_applications_tab",
+                 "_render_application_body"):
         assert hasattr(old, name), name
+    assert not hasattr(old, "render_candidates_page")       # the page itself is gone
     # Existence only, not identity: other tests leave stubs on the old module (the
     # known stub leak), so `is` comparisons are order-dependent.
     assert callable(workspace._render_ranking_section)
     assert callable(workspace._render_applications_tab)
 
 
-def test_the_interviews_entry_is_still_registered_until_increment_5():
-    assert ("Interviews", "interviews") in _nav("HR")
+@pytest.mark.parametrize("role", ["HR", "HIRING_MANAGER", "ADMIN"])
+def test_the_interviews_entry_is_gone_for_every_role(role):
+    assert ("Interviews", "interviews") not in _nav(role)
+    assert "interviews" not in [p for _, p in _nav(role)]
+
+
+def test_the_interviews_module_keeps_its_renderers_but_registers_no_page():
+    import app.pages.interviews as interviews
+
+    assert not hasattr(interviews, "render_interviews_page")
+    for name in ("_render_final_ranking_section", "_render_guide_controls",
+                 "_render_feedback_section", "_render_analysis_section",
+                 "_render_final_scorecard_section", "_render_decision_form",
+                 "_render_final_decision_record"):
+        assert callable(getattr(interviews, name)), name
 
 
 def test_the_dashboard_logic_no_longer_lives_in_main():

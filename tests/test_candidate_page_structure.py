@@ -148,17 +148,14 @@ def test_summary_row_matches_what_the_application_list_always_built():
     assert C._summary_row(app, None, None)["candidate_email"] == "—"
 
 
-def test_the_old_pages_still_call_the_extracted_pieces():
+def test_the_extracted_pieces_are_still_used_by_their_original_callers():
+    # (Increment 5: the Interviews page's row and view are gone; what remains of this
+    # contract is the decision glue and the two original callers below.)
     import inspect
 
     import app.pages.interviews as I
 
-    row_src = inspect.getsource(I._render_candidate_row)
-    assert "_render_guide_controls" in row_src
     section_src = inspect.getsource(I._render_final_decision_section)
     assert "_render_final_decision_record" in section_src and "_render_decision_form" in section_src
-    view_src = inspect.getsource(I._load_view)
-    for loader in ("_load_feedback_state", "_load_analysis_state", "_load_decision_state"):
-        assert loader in view_src
     assert "_render_screening_transcript" in inspect.getsource(I._render_final_scorecard)
     assert "_summary_row" in inspect.getsource(C._load_application_summaries)

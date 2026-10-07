@@ -68,8 +68,6 @@ from app.pages.candidate_page import render_candidate_page
 from app.pages.candidates import _render_applications_tab, _render_ranking_section
 from app.pages.interviews import _render_final_ranking_section
 from app.pages.jobs import _job_view, _render_job_body
-from app.services.interview_feedback_service import list_feedback_views
-from app.services.interview_guide_service import get_shortlisted_candidates_for_job
 from app.services.job_service import get_job
 from app.services.job_workspace_service import (
     STAGE_KEYS,
@@ -79,8 +77,15 @@ from app.services.job_workspace_service import (
     get_job_stage_summary,
     list_interview_overview,
     list_job_candidates,
+    list_shortlist_overview,
 )
 from app.utils.authorization import UnauthorizedError
+from app.utils.ranking_drift import (
+    drift_note,
+    ranking_drift,
+    rubric_label,
+    version_note,
+)
 from app.utils.ui import label_for, stage_label, status_kind
 from app.utils.ui_widgets import load_error, page_header
 from app.utils.workspace_nav import (
@@ -262,17 +267,9 @@ def _stage_shortlist(job_id: str, acting_user_id) -> None:
     st.subheader("Shortlist")
     try:
         with session_scope() as db:
-            rows = get_shortlisted_candidates_for_job(
-                db, job_id=job_id, acting_user_id=acting_user_id
+            rows = list_shortlist_overview(
+                db, job_id, acting_user_id=acting_user_id
             )
-            rounds = {
-                r.application_id: len(
-                    list_feedback_views(
-                        db, r.application_id, acting_user_id=acting_user_id
-                    )
-                )
-                for r in rows
-            }
     except UnauthorizedError:
         st.error(_INACTIVE)
         return
@@ -287,13 +284,27 @@ def _stage_shortlist(job_id: str, acting_user_id) -> None:
         )
         return
 
+    note = version_note(r.rubric_version_number for r in rows)
+    if note:
+        st.caption(note)
+
     event = st.dataframe(
         [
             {
                 "Candidate": r.candidate_name,
                 "Screening rank": _shortlist_rank_text(r),
+                "Ranking note": drift_note(
+                    ranking_drift(
+                        r.current_rank_available,
+                        r.current_rank_position,
+                        r.rank_position_at_decision,
+                    )
+                ),
+                "Rubric": rubric_label(
+                    r.rubric_version_number, r.rubric_version_status
+                ),
                 "Interview guide": "Generated" if r.guide_exists else "Not generated",
-                "Rounds recorded": rounds.get(r.application_id, 0),
+                "Rounds recorded": r.rounds_count,
             }
             for r in rows
         ],

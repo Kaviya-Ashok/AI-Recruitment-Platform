@@ -492,12 +492,13 @@ def test_switching_to_upload_shows_the_file_uploader_as_before():
 # --- structure -----------------------------------------------------------------------------------------------------
 
 
-def test_the_page_emits_no_html_and_the_old_card_internals_are_retained_only_where_tests_use_them():
+def test_the_page_emits_no_html_and_the_old_card_list_is_gone():
     import ast
     import inspect
 
     source = inspect.getsource(J)
     assert "unsafe_allow_html" not in source and "<div" not in source
     names = {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)}
-    assert {"_render_job_card", "_card_label", "_render_create_form", "_handle_submit"} <= names
+    assert {"_render_create_form", "_handle_submit", "_render_job_body", "_job_view"} <= names
+    assert not {"_render_job_card", "_card_label"} & names           # removed in Increment 5
     assert not {"_render_tab", "_shown_count"} & names              # the lazy-card list is gone

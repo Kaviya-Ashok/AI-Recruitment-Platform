@@ -95,11 +95,20 @@ W._stage_interviews = _spy("interviews")
 W._stage_final_ranking = _spy("final_ranking")
 
 J._render_create_form = lambda uid: None
-J._render_job_list = lambda uid: J._render_job_card(
-    {"id": _JOB, "job_code": "V_001", "title": "Backend Engineer",
-     "department": "Eng", "status": "OPEN", "created_at": None, "has_jd": True},
-    uid, default_expanded=False,
-)
+
+
+def _stand_in_job_list(uid):
+    """A minimal job list for the workspace tests. The real list is a table whose row
+    selection opens the workspace (tests/test_jobs_table_page.py); the old card list
+    these buttons came from was removed in Increment 5. What these tests need is only
+    a way to open the workspace and to recognise "the list" again afterwards."""
+    from app.utils.workspace_nav import open_workspace
+
+    st.button("Open workspace", key=f"ws_open_{_JOB}", on_click=open_workspace,
+              args=(_JOB,))
+
+
+J._render_job_list = _stand_in_job_list
 
 st.session_state[SESSION_USER_KEY] = {
     "id": "11111111-1111-1111-1111-111111111111",
@@ -155,20 +164,16 @@ def _keys(at: AppTest) -> list[str]:
 # --- list -> workspace -------------------------------------------------------------
 
 
-def test_the_job_list_offers_open_workspace_and_a_title_button():
+def test_the_list_alone_shows_no_workspace_and_runs_no_stage_body():
     at = _ok(_app())
-    keys = _keys(at)
-    assert f"ws_open_{_JOB}" in keys and f"ws_title_{_JOB}" in keys
-    assert _button(at, f"ws_open_{_JOB}").label == "Open workspace"
-    assert _button(at, f"ws_title_{_JOB}").label == "Backend Engineer"
+    assert f"ws_open_{_JOB}" in _keys(at)
     assert not at.segmented_control                      # still the list, no workspace
     assert at.session_state["_ran"] == []                # and no stage body ran
 
 
-@pytest.mark.parametrize("key", ["ws_open_", "ws_title_"])
-def test_open_workspace_and_the_title_both_open_the_workspace(key):
+def test_opening_a_job_puts_it_in_the_url_and_shows_its_workspace():
     at = _ok(_app())
-    _button(at, f"{key}{_JOB}").click().run()
+    _button(at, f"ws_open_{_JOB}").click().run()
     _ok(at)
     assert at.query_params["job"] == [_JOB] or at.query_params["job"] == _JOB
     assert len(at.segmented_control) == 1

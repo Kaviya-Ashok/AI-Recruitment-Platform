@@ -321,6 +321,16 @@ class CandidateHeader:
     decision: str | None
     decided_by_name: str | None
     decided_at: datetime | None
+    #: The CURRENT shortlist entry's context (all empty / ``False`` when the
+    #: application is not shortlisted): the rubric version it was shortlisted
+    #: against, the screening rank recorded then, and the rank in that SAME version
+    #: now (``current_rank_available`` is ``False`` when no ranking row exists for
+    #: it). Read by the page through ``utils.ranking_drift``.
+    shortlist_rubric_version_number: int | None = None
+    shortlist_rubric_version_status: str | None = None
+    rank_position_at_shortlisting: int | None = None
+    current_rank_position: int | None = None
+    current_rank_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -428,6 +438,43 @@ def get_candidate_header(
         ),
     )
 
+    # The shortlist context rides in the same statement as correlated scalars, so
+    # the query budget below is unchanged.
+    _entry_here = (
+        CandidateShortlistEntry.application_id == Application.id,
+        CandidateShortlistEntry.is_shortlisted.is_(True),
+    )
+    sl_rank_q = (
+        select(CandidateShortlistEntry.rank_position_at_decision)
+        .where(*_entry_here).limit(1).scalar_subquery()
+    )
+    sl_version_q = (
+        select(RubricVersion.version_number)
+        .join(
+            CandidateShortlistEntry,
+            CandidateShortlistEntry.rubric_version_id == RubricVersion.id,
+        )
+        .where(*_entry_here).limit(1).scalar_subquery()
+    )
+    sl_status_q = (
+        select(RubricVersion.status)
+        .join(
+            CandidateShortlistEntry,
+            CandidateShortlistEntry.rubric_version_id == RubricVersion.id,
+        )
+        .where(*_entry_here).limit(1).scalar_subquery()
+    )
+    _ranking_here = (
+        CandidateRanking.job_id == CandidateShortlistEntry.job_id,
+        CandidateRanking.rubric_version_id == CandidateShortlistEntry.rubric_version_id,
+        CandidateRanking.application_id == CandidateShortlistEntry.application_id,
+    )
+    cur_rank_q = (
+        select(CandidateRanking.rank_position)
+        .where(*_ranking_here, *_entry_here).limit(1).scalar_subquery()
+    )
+    cur_available_q = exists().where(*_ranking_here, *_entry_here)
+
     row = db.execute(
         select(
             Application.status,
@@ -441,6 +488,11 @@ def get_candidate_header(
             analysis_q,
             shortlisted_q,
             screened_q,
+            sl_rank_q,
+            sl_version_q,
+            sl_status_q,
+            cur_rank_q,
+            cur_available_q,
         )
         .join(Candidate, Candidate.id == Application.candidate_id)
         .join(Job, Job.id == Application.job_id)
@@ -451,6 +503,7 @@ def get_candidate_header(
     (
         status, name, email, code, title, rounds, unrated, transcripts,
         has_analysis, shortlisted, screened,
+        sl_rank, sl_version, sl_status, cur_rank, cur_available,
     ) = row
 
     final = db.execute(
@@ -523,6 +576,11 @@ def get_candidate_header(
         decision=decision[0] if decision is not None else None,
         decided_by_name=(decision[2] or "—") if decision is not None else None,
         decided_at=decision[1] if decision is not None else None,
+        shortlist_rubric_version_number=sl_version if shortlisted else None,
+        shortlist_rubric_version_status=sl_status if shortlisted else None,
+        rank_position_at_shortlisting=sl_rank if shortlisted else None,
+        current_rank_position=cur_rank if shortlisted else None,
+        current_rank_available=bool(cur_available) if shortlisted else False,
     )
 
 
@@ -721,3 +779,109 @@ def list_candidate_activity(
         .limit(limit)
     ).all()
     return [ActivityItem(t, ts, who) for t, ts, who in rows]
+
+
+# --- Increment 5: the Shortlist stage, in one statement ----------------------------
+
+
+@dataclass(frozen=True)
+class ShortlistOverviewRow:
+    """One currently-shortlisted candidate of a job, with what the Shortlist stage
+    shows: the rubric version shortlisted against, the rank then and the rank in that
+    SAME version now, whether a guide exists and how many rounds are recorded."""
+
+    application_id: uuid.UUID
+    candidate_name: str
+    rubric_version_number: int | None
+    rubric_version_status: str | None
+    rank_position_at_decision: int | None
+    current_rank_position: int | None
+    current_rank_available: bool
+    guide_exists: bool
+    rounds_count: int
+
+
+def list_shortlist_overview(
+    db: Session,
+    job_id: uuid.UUID | str,
+    *,
+    acting_user_id: uuid.UUID | str,
+) -> list[ShortlistOverviewRow]:
+    """Every currently-shortlisted candidate of the job — HR/INTERNAL ONLY, read-only.
+
+    Query budget: the guard plus ONE statement, whatever the number of rows (the
+    older ``interview_guide_service.get_shortlisted_candidates_for_job`` is unchanged
+    and still serves the guide flow; it reads each row separately). The rank is read
+    from the ranking of the SAME rubric version the candidate was shortlisted
+    against — versions are never merged. Order: rubric version (unknown last), then
+    the current rank, then the rank at shortlisting (unranked last), then name.
+    """
+    require_internal_user(db, acting_user_id)
+    job_uuid = _as_uuid(job_id)
+    if job_uuid is None:
+        return []
+
+    guide_q = exists().where(
+        InterviewGuide.application_id == CandidateShortlistEntry.application_id
+    )
+    rounds_q = (
+        select(func.count(InterviewFeedback.id))
+        .where(InterviewFeedback.application_id == CandidateShortlistEntry.application_id)
+        .scalar_subquery()
+    )
+    rows = db.execute(
+        select(
+            CandidateShortlistEntry.application_id,
+            Candidate.full_name,
+            RubricVersion.version_number,
+            RubricVersion.status,
+            CandidateShortlistEntry.rank_position_at_decision,
+            CandidateRanking.rank_position,
+            CandidateRanking.id.is_not(None),
+            guide_q,
+            rounds_q,
+        )
+        .join(Application, Application.id == CandidateShortlistEntry.application_id)
+        .join(Candidate, Candidate.id == Application.candidate_id)
+        .outerjoin(
+            RubricVersion, RubricVersion.id == CandidateShortlistEntry.rubric_version_id
+        )
+        .outerjoin(
+            CandidateRanking,
+            (CandidateRanking.job_id == CandidateShortlistEntry.job_id)
+            & (CandidateRanking.rubric_version_id == CandidateShortlistEntry.rubric_version_id)
+            & (CandidateRanking.application_id == CandidateShortlistEntry.application_id),
+        )
+        .where(
+            CandidateShortlistEntry.job_id == job_uuid,
+            CandidateShortlistEntry.is_shortlisted.is_(True),
+        )
+    ).all()
+
+    out = [
+        ShortlistOverviewRow(
+            application_id=app_id,
+            candidate_name=name,
+            rubric_version_number=version,
+            rubric_version_status=status,
+            rank_position_at_decision=at_decision,
+            current_rank_position=current,
+            current_rank_available=bool(available),
+            guide_exists=bool(guide),
+            rounds_count=int(rounds or 0),
+        )
+        for app_id, name, version, status, at_decision, current, available, guide, rounds
+        in rows
+    ]
+    out.sort(
+        key=lambda r: (
+            r.rubric_version_number is None,
+            r.rubric_version_number or 0,
+            r.current_rank_position is None,
+            r.current_rank_position or 0,
+            r.rank_position_at_decision is None,
+            r.rank_position_at_decision or 0,
+            r.candidate_name.lower(),
+        )
+    )
+    return out

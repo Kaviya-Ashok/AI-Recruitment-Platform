@@ -275,11 +275,13 @@ def status_badge(value: str | None) -> str:
 # label always states the status in words (CLAUDE.md §26).
 
 ENTITY_ICONS: dict[str, str] = {
-    "job": "📁",         # a requisition and its lifecycle
-    "application": "👤",  # one candidate's application
-    "screening": "💬",    # the AI screening conversation / session
-    "shortlist": "⭐",    # an HR selection decision
-    "ranking": "📊",      # rank position, eligibility, drift, staleness
+    # Material icons, not emoji: they render the same everywhere and take the text
+    # colour (Increment 5). ``:green-badge[:material/work: Open]`` is native Streamlit.
+    "job": ":material/work:",             # a requisition and its lifecycle
+    "application": ":material/person:",   # one candidate's application
+    "screening": ":material/chat:",       # the AI screening conversation / session
+    "shortlist": ":material/star:",       # an HR selection decision
+    "ranking": ":material/leaderboard:",  # rank position, eligibility, drift, staleness
 }
 
 

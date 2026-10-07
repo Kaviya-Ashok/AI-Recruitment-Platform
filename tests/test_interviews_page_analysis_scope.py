@@ -14,19 +14,8 @@ import app.pages.interviews as I
 
 _TIMEOUT = 60
 
-_PATCHED_ATTRS = ("_load_view", "load_job_options", "_render_shortlisted_section")
-_PRISTINE = {name: getattr(I, name) for name in _PATCHED_ATTRS}
-
-
-@pytest.fixture(autouse=True)
-def _restore_interviews_module():
-    for name, value in _PRISTINE.items():
-        setattr(I, name, value)
-    try:
-        yield
-    finally:
-        for name, value in _PRISTINE.items():
-            setattr(I, name, value)
+# Increment 5: the scripts here patch nothing on the page module any more (the old
+# page entry points they used to stub are gone), so there is no restore fixture.
 
 
 _SCRIPT = '''

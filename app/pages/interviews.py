@@ -1,5 +1,16 @@
-"""Interviews page — HR-facing consolidated shortlist view + interview-guide
-generation and display (CLAUDE.md §6; Phase 4 Step 7).
+"""Interview renderers — guides, feedback, transcripts, analysis, the final
+scorecard, the final ranking and the final decision (CLAUDE.md §§6-11).
+
+HR UI Increment 5: this module no longer registers a page. The old Interviews page
+(a job picker over a shortlist of candidate cards) was replaced by the job workspace
+and the candidate page, which REUSE the renderers below: the workspace's Final
+ranking stage calls ``_render_final_ranking_section``; the candidate page's tabs call
+the guide, feedback, analysis, scorecard and decision renderers. The history below
+describes how each piece came to be; where it says "page" or "section", read "the
+renderer".
+
+Originally: the Interviews page — HR-facing consolidated shortlist view +
+interview-guide generation and display (Phase 4 Step 7).
 
 Scope (deliberately minimal)
 ----------------------------
@@ -96,8 +107,6 @@ from app.services.interview_feedback_service import (
 from app.services.interview_guide_service import (
     InterviewGuideError,
     generate_interview_guide,
-    get_shortlisted_candidates_for_job,
-    list_interview_guides_for_job,
 )
 from app.services.interview_transcript_service import (
     InterviewTranscriptError,
@@ -125,13 +134,9 @@ from app.utils.ui import (
     score_out_of_ten,
 )
 from app.utils.ui_widgets import (
-    HR_JOB_PICKER_KEY,
     confirmed,
     detail_lines,
-    job_picker,
     load_error,
-    load_job_options,
-    page_header,
     success_toast,
 )
 
@@ -258,42 +263,6 @@ def _load_decision_state(db, application_id, acting_user_id) -> dict:
             db, application_id, acting_user_id=acting_user_id
         ),
     }
-
-
-def _load_view(job_id: str, acting_user_id) -> dict:
-    with session_scope() as db:
-        shortlisted = get_shortlisted_candidates_for_job(
-            db, job_id=job_id, acting_user_id=acting_user_id
-        )
-        guides = list_interview_guides_for_job(
-            db, job_id=job_id, acting_user_id=acting_user_id
-        )
-        # Feedback for every application on screen — the shortlisted ones and
-        # the retained-guide ones alike, since feedback does not depend on
-        # current shortlist state.
-        application_ids = {r.application_id for r in shortlisted} | {
-            g.application_id for g in guides
-        }
-        feedback = {
-            app_id: _load_feedback_state(db, app_id, acting_user_id)
-            for app_id in application_ids
-        }
-        analyses = {
-            app_id: _load_analysis_state(db, app_id, acting_user_id)
-            for app_id in application_ids
-        }
-        decisions = {
-            app_id: _load_decision_state(db, app_id, acting_user_id)
-            for app_id in application_ids
-        }
-        # primitives / frozen dataclasses only — safe outside the session
-        return {
-            "shortlisted": shortlisted,
-            "guides_by_application": {g.application_id: g for g in guides},
-            "feedback_by_application": feedback,
-            "analysis_by_application": analyses,
-            "decision_by_application": decisions,
-        }
 
 
 def _run_generate_guide(application_id: str, acting_user_id, *, force: bool) -> None:
@@ -1029,10 +998,10 @@ def _render_final_ranked_row(entry, run, decision=None) -> None:
     st.caption(entry.candidate_email)
     if entry.mandatory_unknown:
         st.warning(
-            "⚠️ A mandatory requirement had no evidence either way for this "
+            "A mandatory requirement had no evidence either way for this "
             "candidate — the rank reflects only what could be assessed. Not a "
             "failure; worth confirming at interview.",
-            icon="⚠️",
+            icon=":material/warning:",
         )
     _render_final_entry_breakdown(entry, run)
     _render_final_entry_context(entry)
@@ -2143,174 +2112,3 @@ def _render_guide_controls(
     if guide is not None:
         with st.expander("Interview guide", expanded=not guide_exists):
             _render_guide(guide)
-
-
-def _render_candidate_row(
-    row, guide, feedback_state, analysis_state, acting_user_id,
-    decision_state=None,
-) -> None:
-    drift = ""
-    if row.current_rank_available and row.current_rank_position is not None:
-        if (
-            row.rank_position_at_decision is not None
-            and row.current_rank_position != row.rank_position_at_decision
-        ):
-            drift = "  " + entity_badge(
-                "ranking",
-                "caution",
-                f"Ranking changed — shortlisted at "
-                f"#{row.rank_position_at_decision}, now "
-                f"#{row.current_rank_position}",
-            )
-        else:
-            drift = f"  ·  currently #{row.current_rank_position}"
-    elif not row.current_rank_available:
-        drift = "  ·  " + entity_badge(
-            "ranking", "neutral", "Ranking not regenerated since shortlisting"
-        )
-    else:  # ranked row exists but position is NULL (ineligible)
-        drift = "  ·  " + entity_badge("ranking", "neutral", "Not currently ranked")
-
-    at = (
-        f"shortlisted at #{row.rank_position_at_decision}"
-        if row.rank_position_at_decision is not None
-        else "shortlisted (was not ranked)"
-    )
-    st.markdown(f"**{row.candidate_name}**  ·  {at}{drift}")
-    st.caption(row.candidate_email)
-    if row.shortlist_reason:
-        st.caption(f"HR note: {row.shortlist_reason}")
-
-    _render_guide_controls(
-        row.application_id, guide, row.guide_exists, acting_user_id
-    )
-    _render_feedback_section(row.application_id, feedback_state, acting_user_id)
-    _render_analysis_section(
-        row.application_id, feedback_state, analysis_state, acting_user_id
-    )
-    _render_final_scorecard_section(row.application_id, acting_user_id)
-    _render_final_decision_section(
-        row.application_id, decision_state, acting_user_id
-    )
-    st.divider()
-
-
-def _render_shortlisted_section(job_id: str, acting_user_id) -> None:
-    st.subheader("Shortlisted candidates")
-    try:
-        view = _load_view(job_id, acting_user_id)
-    except UnauthorizedError:
-        st.error("Your account is no longer active — please contact an admin.")
-        return
-    except SQLAlchemyError:
-        load_error("Couldn't load the shortlist right now.")
-        return
-
-    shortlisted = view["shortlisted"]
-    guides = view["guides_by_application"]
-    feedback_state = view["feedback_by_application"]
-    analysis_state = view["analysis_by_application"]
-    decision_state = view.get("decision_by_application")
-
-    if not shortlisted:
-        st.caption("No candidates are currently shortlisted for this job.")
-    else:
-        # group by rubric version, preserving the service's sort order
-        _unset = object()
-        current_version = _unset
-        for row in shortlisted:
-            if current_version is _unset or row.rubric_version_number != current_version:
-                current_version = row.rubric_version_number
-                label = (
-                    f"Rubric v{row.rubric_version_number}"
-                    if row.rubric_version_number is not None
-                    else "Rubric (unknown version)"
-                )
-                status = (
-                    f" — {label_for(row.rubric_version_status)}"
-                    if row.rubric_version_status
-                    and row.rubric_version_status != "APPROVED"
-                    else ""
-                )
-                st.markdown(f"#### {label}{status}")
-                st.caption(
-                    "Guide actions in this section are grounded in this rubric "
-                    "version — never merged with candidates from another version."
-                )
-            with st.container(border=True):
-                _render_candidate_row(
-                    row, guides.get(row.application_id), feedback_state,
-                    analysis_state, acting_user_id, decision_state,
-                )
-
-    # Guides retained for candidates no longer shortlisted — readable, but no
-    # new generation is offered.
-    retained = [
-        g for aid, g in guides.items()
-        if not shortlisted or aid not in {r.application_id for r in shortlisted}
-    ]
-    if retained:
-        st.subheader("Retained guides — candidates no longer shortlisted")
-        st.caption(
-            "These candidates have since been removed from the shortlist. Their "
-            "previously generated guide stays readable; a new guide cannot be "
-            "generated unless they are shortlisted again."
-        )
-        for g in retained:
-            with st.container(border=True):
-                st.info(
-                    "Not currently shortlisted — interview-guide generation is "
-                    "blocked for this candidate. Interview feedback can still "
-                    "be recorded: an interview that happened stays recordable."
-                )
-                with st.expander("Interview guide", expanded=False):
-                    _render_guide(g)
-                _render_feedback_section(
-                    g.application_id, feedback_state, acting_user_id
-                )
-                _render_analysis_section(
-                    g.application_id, feedback_state, analysis_state,
-                    acting_user_id,
-                )
-                _render_final_scorecard_section(
-                    g.application_id, acting_user_id
-                )
-                _render_final_decision_section(
-                    g.application_id, decision_state, acting_user_id
-                )
-
-
-def render_interviews_page() -> None:
-    current = get_current_user(st.session_state)
-    if current is None:  # defensive: gate is in main.py
-        st.error("Please sign in.")
-        return
-
-    try:
-        acting_user_id = uuid.UUID(current["id"])
-    except (ValueError, KeyError, TypeError):
-        st.error("Your session looks invalid — please sign out and back in.")
-        return
-
-    page_header(
-        "Interviews",
-        "Interview guides for shortlisted candidates. The MVP has no live AI "
-        "interviewer — the guide is generated here for a human interviewer to "
-        "run the interview.",
-    )
-
-    try:
-        jobs = load_job_options()
-    except SQLAlchemyError:
-        load_error("Couldn't load jobs right now.")
-        return
-    if not jobs:
-        st.caption("No jobs yet — create one on the Jobs page first.")
-        return
-
-    job_id = job_picker(jobs, key=HR_JOB_PICKER_KEY)
-    if job_id is None:
-        return
-    _render_final_ranking_section(job_id, acting_user_id)
-    st.divider()
-    _render_shortlisted_section(job_id, acting_user_id)

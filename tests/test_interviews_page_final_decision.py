@@ -17,7 +17,6 @@ import app.pages.interviews as I
 _TIMEOUT = 60
 
 _PATCHED_ATTRS = (
-    "_load_view", "load_job_options", "_render_shortlisted_section",
     "_run_record_final_decision", "record_final_decision", "session_scope",
     "_load_final_ranking_view", "_run_generate_final_ranking",
 )

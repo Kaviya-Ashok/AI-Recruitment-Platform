@@ -21,13 +21,10 @@ import app.pages.interviews as I
 _TIMEOUT = 60
 
 _PATCHED_ATTRS = (
-    "_load_view",
-    "load_job_options",
     "session_scope",
     "create_interview_feedback",
     "attach_interview_transcript",
     "get_transcript_download_bytes",
-    "_render_shortlisted_section",
 )
 _PRISTINE = {name: getattr(I, name) for name in _PATCHED_ATTRS}
 

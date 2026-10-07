@@ -29,19 +29,8 @@ _TIMEOUT = 60
 #: executes in THIS process, so those assignments mutate the real module and
 #: would leak into every later test — the fixture restores them.
 #:
-#: ``_render_shortlisted_section`` is in this list even though no script here
-#: assigns it: ``tests/test_candidates_page_structure.py`` replaces it on this
-#: same module and does not put it back, so by the time these tests run it can
-#: already be a stub that renders nothing. This file is the first to depend on
-#: it actually running, which is why the leak only surfaces here.
 _PATCHED_ATTRS = (
-    "_load_view",
-    "load_job_options",
     "create_post_interview_analysis",
-    "_render_feedback_section",
-    "_render_final_ranking_section",
-    "_render_final_decision_section",
-    "_render_shortlisted_section",
 )
 
 #: Captured at IMPORT time, not fixture-setup time. pytest finishes collecting
@@ -135,28 +124,10 @@ history = ([current] if current is not None else []) + [
     for i in range({superseded})
 ]
 
-I._load_view = lambda job_id, acting_user_id: {{
-    "shortlisted": [_Row()],
-    "guides_by_application": {{}},
-    "feedback_by_application": {{
-        APP_ID: {{"context": None, "history": ([object()] if {has_feedback} else [])}}
-    }},
-    "analysis_by_application": {{
-        APP_ID: {{"current": current, "history": history}}
-    }},
+FEEDBACK = {{
+    APP_ID: {{"context": None, "history": ([object()] if {has_feedback} else [])}}
 }}
-I.load_job_options = lambda: [
-    {{"id": "job-1", "title": "Backend Engineer", "status": "OPEN"}}
-]
-# Step 8's block is not under test here; stubbing it keeps the feedback
-# fixtures to the one thing the analysis section actually reads (whether any
-# feedback exists at all).
-I._render_feedback_section = lambda *a, **k: None
-# Step 10b's per-job final-ranking section is not under test here (and would hit
-# the database); stubbed like the other sections.
-I._render_final_ranking_section = lambda *a, **k: None
-# Step 11's per-candidate decision section is not under test here either.
-I._render_final_decision_section = lambda *a, **k: None
+ANALYSIS = {{APP_ID: {{"current": current, "history": history}}}}
 
 
 def fake_create(*a, **k):
@@ -171,7 +142,11 @@ st.session_state[SESSION_USER_KEY] = {{
     "full_name": "P",
     "role": "HR",
 }}
-I.render_interviews_page()
+# Increment 5: the old Interviews page is gone; the candidate page's AI analysis tab
+# calls this same section directly, so the tests call it too.
+I._render_analysis_section(
+    APP_ID, FEEDBACK, ANALYSIS, "11111111-1111-1111-1111-111111111111"
+)
 st.session_state["_ai_calls"] = len(AI_CALLS)
 '''
 

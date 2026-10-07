@@ -66,6 +66,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.database.database import session_scope
 from app.pages import candidates as _candidates
 from app.pages import interviews as _interviews
+from app.utils.ranking_drift import ranking_drift, rubric_label
 from app.services.final_decision_service import role_may_decide
 from app.services.interview_guide_service import get_interview_guide_for_application
 from app.services.job_workspace_service import (
@@ -136,7 +137,7 @@ class _Ctx:
 
 
 def _can_decide() -> bool:
-    """The same role gate the Interviews page uses (hiring manager or admin)."""
+    """The role gate for recording a decision (hiring manager or admin)."""
     return role_may_decide((get_current_user(st.session_state) or {}).get("role"))
 
 
@@ -206,6 +207,27 @@ def _decision_button_label(header: CandidateHeader) -> str:
 # --- tab bodies -----------------------------------------------------------------------
 
 
+def _render_shortlist_context(h: CandidateHeader) -> None:
+    """Under the page header, for a shortlisted candidate: the rubric version they
+    were shortlisted against and what has happened to their rank since. A change is a
+    warning (its words say what changed — colour is never the only signal); anything
+    else is a quiet line. Nothing is shown for a candidate who is not shortlisted."""
+    if not h.is_shortlisted:
+        return
+    drift = ranking_drift(
+        h.current_rank_available,
+        h.current_rank_position,
+        h.rank_position_at_shortlisting,
+    )
+    version = rubric_label(
+        h.shortlist_rubric_version_number, h.shortlist_rubric_version_status
+    )
+    if drift.caution:
+        st.warning(f"{version} · {drift.text}", icon=":material/swap_vert:")
+    else:
+        st.caption(f"Shortlisted on {version} · {drift.text}")
+
+
 def _tab_overview(ctx: _Ctx) -> None:
     h = ctx.header
     if h.entry_status == "NOT_RANKED_INELIGIBLE":
@@ -240,7 +262,14 @@ def _tab_overview(ctx: _Ctx) -> None:
                 + " · "
                 + rank_text(h.final_rank, h.final_ranked_count, h.entry_status),
             ),
-            ("Shortlisted", "Yes" if h.is_shortlisted else "No"),
+            (
+                "Shortlisted",
+                "Yes — " + rubric_label(
+                    h.shortlist_rubric_version_number,
+                    h.shortlist_rubric_version_status,
+                )
+                if h.is_shortlisted else "No",
+            ),
             ("Interview transcripts", str(h.transcripts_count)),
             ("AI analysis", "Generated" if h.has_analysis else "Not generated"),
         ])
@@ -334,7 +363,7 @@ def _tab_interview(ctx: _Ctx) -> None:
             h.application_id, guide, guide is not None, uid
         )
     else:
-        # Same rule as the Interviews page's "retained guide" card: a guide made
+        # The "retained guide" rule (kept from the old Interviews page): a guide made
         # while shortlisted stays readable, none can be generated now.
         st.info(_NOT_SHORTLISTED)
         if guide is not None:
@@ -575,6 +604,8 @@ def render_candidate_page(acting_user_id: uuid.UUID | None) -> None:
         ),
         status_text=stage_name(header),
     )
+
+    _render_shortlist_context(header)
 
     # The primary decision button is available on every tab (role gated).
     if ctx.can_decide:

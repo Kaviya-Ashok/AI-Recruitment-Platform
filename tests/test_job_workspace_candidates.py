@@ -29,7 +29,7 @@ _C = "00000000-0000-4000-8000-00000000000c"
 
 _W_ATTRS = (
     "session_scope", "get_job_stage_summary", "list_interview_overview",
-    "list_job_candidates", "get_shortlisted_candidates_for_job", "list_feedback_views",
+    "list_job_candidates", "list_shortlist_overview",
     "_render_ranking_section", "_render_applications_tab",
     "_render_final_ranking_section", "_stage_setup",
 )
@@ -79,6 +79,7 @@ from tests.test_job_workspace_page import _build_summary
 st.session_state.setdefault("_ran", [])
 RAISE = __RAISE__
 EMPTY = __EMPTY__
+SHORTLIST_MODE = __MODE__
 
 
 @contextlib.contextmanager
@@ -116,17 +117,23 @@ def _candidates(db, job_id, *, acting_user_id):
             JobCandidate(_u(__C__), "Cy Coder", None)]
 
 
-def _shortlisted(db, *, job_id, acting_user_id):
+def _shortlisted(db, job_id, *, acting_user_id):
     _maybe_raise()
     if EMPTY:
         return []
+    # SHORTLIST_MODE: "single" (both rows on Rubric v2), "multi" (Ada on v2, Bo on a
+    # superseded v1) or "drift" (single version; Ada's rank moved from #1 to #3).
+    bo_version = (1, "SUPERSEDED") if SHORTLIST_MODE == "multi" else (2, "APPROVED")
+    ada_now = 3 if SHORTLIST_MODE == "drift" else 1
     return [
         NS(application_id=_u(__A__), candidate_name="Ada Lovelace",
-           current_rank_available=True, current_rank_position=1,
-           rank_position_at_decision=1, guide_exists=True),
+           rubric_version_number=2, rubric_version_status="APPROVED",
+           current_rank_available=True, current_rank_position=ada_now,
+           rank_position_at_decision=1, guide_exists=True, rounds_count=2),
         NS(application_id=_u(__B__), candidate_name="Bo Builder",
+           rubric_version_number=bo_version[0], rubric_version_status=bo_version[1],
            current_rank_available=False, current_rank_position=None,
-           rank_position_at_decision=2, guide_exists=False),
+           rank_position_at_decision=2, guide_exists=False, rounds_count=0),
     ]
 
 
@@ -149,8 +156,7 @@ W.session_scope = _scope
 W.get_job_stage_summary = lambda db, job_id, *, acting_user_id: _build_summary()
 W.list_interview_overview = _overview
 W.list_job_candidates = _candidates
-W.get_shortlisted_candidates_for_job = _shortlisted
-W.list_feedback_views = lambda db, app_id, *, acting_user_id: ["round"] * (2 if str(app_id) == __A__ else 0)
+W.list_shortlist_overview = _shortlisted
 W._render_ranking_section = _spy("ranking")
 W._render_applications_tab = _spy("applications")
 W._render_final_ranking_section = _spy("final_ranking")
@@ -172,9 +178,10 @@ J.render_jobs_page()
 
 
 def _app(stage: str, *, raise_: str | None = None, empty: bool = False,
-         **extra: str) -> AppTest:
+         mode: str = "single", **extra: str) -> AppTest:
     script = (
         _SCRIPT.replace("__RAISE__", repr(raise_)).replace("__EMPTY__", repr(empty))
+        .replace("__MODE__", repr(mode))
         .replace("__A__", repr(_A)).replace("__B__", repr(_B)).replace("__C__", repr(_C))
     )
     at = AppTest.from_string(script, default_timeout=_TIMEOUT)
@@ -293,14 +300,45 @@ def test_no_selection_opens_nothing():
 def test_the_shortlist_table_keeps_its_columns_and_values():
     at = _ok(_app("shortlist"))
     df = at.dataframe[0].value
+    # Increment 5 added "Ranking note" and "Rubric" (deliberate); the original four
+    # columns and their values are unchanged.
     assert list(df.columns) == [
-        "Candidate", "Screening rank", "Interview guide", "Rounds recorded",
+        "Candidate", "Screening rank", "Ranking note", "Rubric",
+        "Interview guide", "Rounds recorded",
     ]
-    assert df.to_dict("records") == [
+    assert df[["Candidate", "Screening rank", "Interview guide", "Rounds recorded"]
+              ].to_dict("records") == [
         {"Candidate": "Ada Lovelace", "Screening rank": "#1",
          "Interview guide": "Generated", "Rounds recorded": 2},
         {"Candidate": "Bo Builder", "Screening rank": "#2 (at shortlisting)",
          "Interview guide": "Not generated", "Rounds recorded": 0},
+    ]
+
+
+def test_each_shortlist_row_carries_its_rubric_version_and_ranking_note():
+    df = _ok(_app("shortlist")).dataframe[0].value
+    assert list(df["Rubric"]) == ["Rubric v2", "Rubric v2"]
+    # Ada is unchanged (no note); Bo has no ranking row for his version
+    assert list(df["Ranking note"]) == ["", "Ranking not regenerated since shortlisting"]
+
+
+def test_a_moved_rank_shows_the_exact_ranking_changed_message_in_its_row():
+    df = _ok(_app("shortlist", mode="drift")).dataframe[0].value
+    assert df["Ranking note"][0] == "Ranking changed — shortlisted at #1, now #3"
+
+
+def test_one_version_gets_no_version_note():
+    at = _ok(_app("shortlist"))
+    assert "never merged" not in _text(at)
+
+
+def test_several_versions_get_one_note_above_the_table_and_each_row_its_own_label():
+    at = _ok(_app("shortlist", mode="multi"))
+    text = _text(at)
+    assert text.count("Interview guides are tied to their own rubric version") == 1
+    assert "Versions are never merged" in text
+    assert list(at.dataframe[0].value["Rubric"]) == [
+        "Rubric v2", "Rubric v1 — Superseded",
     ]
 
 

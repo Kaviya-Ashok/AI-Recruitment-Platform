@@ -422,7 +422,7 @@ def _nav(role: str) -> list[tuple[str, str]]:
 def test_only_an_admin_has_the_users_page_in_the_navigation():
     admin = _nav("ADMIN")
     assert ("Users", "users") in admin
-    assert [t for t, _ in admin if t != "Users"] == ["Dashboard", "Jobs", "Candidates", "Interviews"]
+    assert [t for t, _ in admin if t != "Users"] == ["Dashboard", "Jobs", "Candidates"]
     for role in ("HR", "HIRING_MANAGER", "SYSTEM", "", "SOMETHING"):
         assert "Users" not in [t for t, _ in _nav(role)], role
 
@@ -460,7 +460,7 @@ def test_the_users_page_is_not_in_the_shared_page_table():
         if isinstance(n, ast.AnnAssign) and getattr(n.target, "id", "") == "_PAGES"
     )
     keys = [k.value for k in table.value.keys]
-    assert keys == ["dashboard", "jobs", "candidates", "interviews"]
+    assert keys == ["dashboard", "jobs", "candidates"]
 
 
 # --- the public candidate app can never reach user administration -----------------------------------------------------

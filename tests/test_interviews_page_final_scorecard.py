@@ -39,14 +39,7 @@ _TIMEOUT = 60
 #: have left stubbed. See tests/test_interviews_page_analysis_section.py for why
 #: the pristine snapshot is taken at import time rather than in the fixture.
 _PATCHED_ATTRS = (
-    "_load_view",
-    "load_job_options",
     "get_final_scorecard",
-    "_render_feedback_section",
-    "_render_final_ranking_section",
-    "_render_final_decision_section",
-    "_render_analysis_section",
-    "_render_shortlisted_section",
 )
 
 _PRISTINE = {name: getattr(I, name) for name in _PATCHED_ATTRS}
@@ -242,23 +235,6 @@ def fake_get(db, application_id, *, acting_user_id):
 
 
 I.get_final_scorecard = fake_get
-I._load_view = lambda job_id, acting_user_id: {{
-    "shortlisted": [_Row()],
-    "guides_by_application": {{}},
-    "feedback_by_application": {{APP_ID: {{"context": None, "history": []}}}},
-    "analysis_by_application": {{APP_ID: {{"current": None, "history": []}}}},
-}}
-I.load_job_options = lambda: [
-    {{"id": "job-1", "title": "Backend Engineer", "status": "OPEN"}}
-]
-# Steps 7-9 blocks are not under test here.
-I._render_feedback_section = lambda *a, **k: None
-# Step 10b's per-job final-ranking section is not under test here (and would hit
-# the database); stubbed like the other sections.
-I._render_final_ranking_section = lambda *a, **k: None
-# Step 11's per-candidate decision section is not under test here either.
-I._render_final_decision_section = lambda *a, **k: None
-I._render_analysis_section = lambda *a, **k: None
 
 if {open_panel}:
     st.session_state[I._scorecard_open_key(APP_ID)] = True
@@ -269,7 +245,9 @@ st.session_state[SESSION_USER_KEY] = {{
     "full_name": "P",
     "role": "HR",
 }}
-I.render_interviews_page()
+# Increment 5: the old Interviews page is gone; the candidate page's Scorecard tab
+# calls this same section directly, so the tests call it too.
+I._render_final_scorecard_section(APP_ID, "11111111-1111-1111-1111-111111111111")
 st.session_state["_calls"] = len(CALLS)
 '''
 

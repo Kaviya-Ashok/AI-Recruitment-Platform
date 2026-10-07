@@ -147,7 +147,7 @@ def success_toast(message: str) -> None:
     Only for the rerun case. A confirmation meant to *stay* on screen (the
     approved-rubric panel, the job-created message) is still ``st.success``.
     """
-    st.toast(message, icon="✅")
+    st.toast(message, icon=":material/check_circle:")
 
 
 # ---------------------------------------------------------------------------

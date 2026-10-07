@@ -1,4 +1,10 @@
-"""Structural guarantees for the Candidates page (Phase C-2, audit H13).
+"""Structural guarantees for the Applicants stage's two tabs (Phase C-2, audit H13;
+re-pointed in HR UI Increment 5).
+
+The old Candidates page is gone. These tests used to run it; they now run the job
+workspace's Applicants stage (``job_workspace._stage_applicants``), which renders the
+very same two tabs through the same renderers (``candidates._render_ranking_section``
+and ``candidates._render_applications_tab``), so the guarantees below are unchanged.
 
 These are the few page-level behaviours that are worth pinning because getting
 them wrong is silent and expensive:
@@ -9,10 +15,9 @@ them wrong is silent and expensive:
 * "Show more" must page in tens and stop at the end;
 * ranking and applications must live in two tabs, so the same candidate is
   never rendered twice in one scroll;
-* the shared job picker must survive navigating to another page and back —
-  Streamlit does NOT do this for a bare widget key (verified: the widget is
-  re-created at its default), which is exactly why ``job_picker`` mirrors the
-  choice into a separate non-widget key.
+
+(The "job picker survives navigating to the Interviews page and back" tests were
+deleted in Increment 5: both pages and their shared picker are gone.)
 
 They use Streamlit's own ``AppTest`` harness with the service layer stubbed, so
 no database and no Streamlit server is involved.
@@ -24,11 +29,42 @@ import pytest
 
 from streamlit.testing.v1 import AppTest
 
-from app.utils.ui_widgets import HR_JOB_PICKER_KEY
+import app.pages.candidates as C
+import app.pages.job_workspace as W
 
 _TIMEOUT = 60
 
-_PICKER_WIDGET = f"{HR_JOB_PICKER_KEY}__widget"
+# THE STUB LEAK, FIXED. ``AppTest.from_string`` runs its script in THIS process, so the
+# ``C.x = stub`` / ``W.x = stub`` lines in the script mutate the real page modules. They
+# used to be left in place, which leaked a do-nothing ``_render_shortlisted_section``
+# into later test files (tests/test_interviews_page_analysis_section.py documented it).
+# Every attribute the script assigns is listed here, snapshotted at import time (before
+# any test has run) and put back after EVERY test. There is deliberately no restore
+# BEFORE a test: the last test of this file asserts nothing leaked, which only means
+# something if the fixture does not quietly mask it.
+_PATCHED = {
+    C: ("_load_application_summaries", "_load_application_detail",
+        "_render_ranking_section", "_render_applications_tab"),
+    W: ("_candidate_selector", "_render_ranking_section", "_render_applications_tab"),
+}
+_PRISTINE = {
+    module: {name: getattr(module, name) for name in names}
+    for module, names in _PATCHED.items()
+}
+
+
+def _restore() -> None:
+    for module, attrs in _PRISTINE.items():
+        for name, value in attrs.items():
+            setattr(module, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _restore_page_modules():
+    try:
+        yield
+    finally:
+        _restore()
 
 
 def _candidates_script(n_applications: int) -> str:
@@ -36,6 +72,7 @@ def _candidates_script(n_applications: int) -> str:
     return f'''
 import streamlit as st
 import app.pages.candidates as C
+import app.pages.job_workspace as W
 from app.utils.session import SESSION_USER_KEY
 
 N = {n_applications}
@@ -73,10 +110,9 @@ def fake_detail(application_id, acting_user_id):
 
 C._load_application_summaries = fake_summaries
 C._load_application_detail = fake_detail
-C.load_job_options = lambda: [
-    {{"id": "job-1", "title": "Backend Engineer", "status": "OPEN"}}
-]
-C._render_ranking_section = lambda *a, **k: st.write("RANKING-TAB-BODY")
+# the Applicants stage's own prelude (the candidate selector) is not under test here
+W._candidate_selector = lambda *a, **k: None
+W._render_ranking_section = lambda *a, **k: st.write("RANKING-TAB-BODY")
 
 st.session_state[SESSION_USER_KEY] = {{
     "id": "11111111-1111-1111-1111-111111111111",
@@ -84,7 +120,7 @@ st.session_state[SESSION_USER_KEY] = {{
     "full_name": "P",
     "role": "HR",
 }}
-C.render_candidates_page()
+W._stage_applicants("job-1", "11111111-1111-1111-1111-111111111111")
 st.session_state["_detail_calls"] = list(DETAIL_CALLS)
 '''
 
@@ -166,66 +202,20 @@ def test_paging_more_does_not_wake_collapsed_cards():
     assert at.session_state["_detail_calls"] == []
 
 
-# --- shared job picker persistence (H19) -----------------------------
-
-_PICKER_SCRIPT = '''
-import streamlit as st
-import app.pages.candidates as C
-import app.pages.interviews as I
-from app.utils.session import SESSION_USER_KEY
-
-JOBS = [
-    {"id": f"job-{i}", "title": f"Role {i}", "status": "OPEN"} for i in range(3)
-]
-C.load_job_options = lambda: JOBS
-I.load_job_options = lambda: JOBS
-C._render_ranking_section = lambda *a, **k: None
-C._render_applications_tab = lambda job_id, *a, **k: st.write(f"job={job_id}")
-I._render_shortlisted_section = lambda job_id, *a, **k: st.write(f"job={job_id}")
-
-st.session_state[SESSION_USER_KEY] = {
-    "id": "11111111-1111-1111-1111-111111111111",
-    "email": "p@x.test",
-    "full_name": "P",
-    "role": "HR",
-}
-if st.session_state.get("page", "candidates") == "candidates":
-    C.render_candidates_page()
-else:
-    I.render_interviews_page()
-'''
+# --- the stub leak is gone --------------------------------------------------------
 
 
-def _selected(at: AppTest) -> str | None:
-    for m in at.markdown:
-        if m.value.startswith("job="):
-            return m.value.removeprefix("job=")
-    return None
+def test_running_the_scripts_patches_the_modules_and_the_fixture_puts_them_back():
+    """The first half proves the scripts really do overwrite page attributes (so the
+    fixture is needed); the next test then proves they were restored."""
+    _run(3)
+    assert C._load_application_summaries is not _PRISTINE[C]["_load_application_summaries"]
+    assert W._render_ranking_section is not _PRISTINE[W]["_render_ranking_section"]
 
 
-def test_job_picker_selection_survives_navigating_away_and_back():
-    at = AppTest.from_string(_PICKER_SCRIPT, default_timeout=_TIMEOUT).run()
-    assert not at.exception, [str(e.value) for e in at.exception]
-    assert _selected(at) == "job-0"
-
-    at.selectbox(key=_PICKER_WIDGET).set_value("job-2").run()
-    assert _selected(at) == "job-2"
-
-    # ...to the Interviews page: it must land on the same job...
-    at.session_state["page"] = "interviews"
-    at.run()
-    assert _selected(at) == "job-2"
-
-    # ...and back again, still job-2. A bare widget key resets to job-0 here.
-    at.session_state["page"] = "candidates"
-    at.run()
-    assert _selected(at) == "job-2"
-
-
-def test_both_pages_use_the_same_picker_key():
-    """Cross-page persistence only works while they agree on the key."""
-    import app.pages.candidates as candidates_page
-    import app.pages.interviews as interviews_page
-
-    assert candidates_page.HR_JOB_PICKER_KEY == HR_JOB_PICKER_KEY
-    assert interviews_page.HR_JOB_PICKER_KEY == HR_JOB_PICKER_KEY
+def test_nothing_the_scripts_patched_is_left_behind_by_the_previous_test():
+    """Runs right after the test above, with no restore of its own in between: if the
+    fixture stopped restoring, this fails. (The old file left these stubs behind.)"""
+    for module, attrs in _PRISTINE.items():
+        for name, value in attrs.items():
+            assert getattr(module, name) is value, (module.__name__, name)

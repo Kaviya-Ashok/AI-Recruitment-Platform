@@ -71,7 +71,7 @@ THEME_CSS = """
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
 }
-[data-testid="stApp"] :is(p,span,div,label,li,a,button,input,textarea,summary,h1,h2,h3,h4,h5,h6,small,strong,em):not([data-testid="stIconMaterial"]):not([data-testid="stIconEmoji"]){
+[data-testid="stApp"] :is(p,span,div,label,li,a,button,input,textarea,summary,h1,h2,h3,h4,h5,h6,small,strong,em):not([data-testid="stIconMaterial"]):not([data-testid="stIconEmoji"]):not([data-testid="stAlertDynamicIcon"]):not([data-testid="stToastDynamicIcon"]){
   font-family:inherit;
 }
 [data-testid="stHeader"]{background:var(--ri-bg);}
@@ -146,7 +146,7 @@ THEME_CSS = """
 [data-testid="stDownloadButton"] button{
   background:var(--ri-surface); color:var(--ri-text); border:1px solid var(--ri-border2);
   border-radius:8px; min-height:34px; padding:0 13px; font-size:13.5px; font-weight:600;
-  box-shadow:none;
+  box-shadow:none; white-space:nowrap;
 }
 [data-testid="stBaseButton-secondary"]:hover,
 [data-testid="stBaseButton-secondaryFormSubmit"]:hover,

@@ -190,6 +190,21 @@ def test_overview_summary_is_plain_key_values():
         assert expected in body, expected
 
 
+def test_overview_summary_names_the_rubric_version_the_candidate_was_shortlisted_on():
+    at = _run(
+        "CP.list_candidate_activity = lambda *a, **k: []\n"
+        + _ctx('make_header(shortlist_rubric_version_number=2, '
+               'shortlist_rubric_version_status="APPROVED")')
+        + "CP._tab_overview(ctx)\n"
+    )
+    assert "Shortlisted:* Yes — Rubric v2" in _text(at)
+    plain = _run(
+        "CP.list_candidate_activity = lambda *a, **k: []\n"
+        + _ctx('make_header(is_shortlisted=False)') + "CP._tab_overview(ctx)\n"
+    )
+    assert "Shortlisted:* No" in _text(plain)
+
+
 def test_overview_activity_lists_label_time_and_actor_only():
     at = _run(
         "when = datetime.datetime(2026, 10, 6, 9, 30, tzinfo=datetime.timezone.utc)\n"
@@ -598,7 +613,7 @@ def test_a_service_error_is_shown_in_place_and_nothing_resets():
     assert not at.exception
 
 
-def test_the_dialog_form_is_the_very_same_function_the_interviews_page_uses():
+def test_the_dialog_form_is_the_very_same_function_the_decision_glue_uses():
     import inspect
 
     assert "_render_decision_form" in inspect.getsource(CP._decision_dialog_body)

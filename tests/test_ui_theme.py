@@ -193,6 +193,31 @@ def test_theme_css_uses_the_one_accent_and_the_system_font_stack():
     assert "font-size:14px" in css
 
 
+def test_the_font_reset_never_touches_any_streamlit_icon_glyph():
+    """Material icons are ligatures: the glyph name is the element's TEXT, drawn by an
+    icon font. The blanket ``font-family:inherit`` reset must therefore skip every
+    element Streamlit uses for one, or the name (``warning``, ``lock`` ...) shows as
+    plain text. Alerts and toasts use their own test ids, not ``stIconMaterial``
+    (found in Increment 5: an ``st.warning(icon=":material/...:")`` showed raw text)."""
+    rule = next(
+        line for line in theme.THEME_CSS.splitlines()
+        if "font-family:inherit" in line or ":is(p,span,div,label" in line
+    )
+    for testid in ("stIconMaterial", "stIconEmoji", "stAlertDynamicIcon",
+                   "stToastDynamicIcon"):
+        assert f':not([data-testid="{testid}"])' in rule, testid
+
+
+def test_secondary_buttons_never_wrap_their_label():
+    """At 768 px the workspace's Previous / Next buttons sit in 1/8-width columns and
+    "Previous" broke into "Previou" / "s" (found in Increment 5). A button label is one
+    short phrase: it must stay on one line."""
+    start = theme.THEME_CSS.index('[data-testid="stBaseButton-secondary"],')
+    rule = theme.THEME_CSS[start: theme.THEME_CSS.index("}", start)]
+    assert "white-space:nowrap" in rule
+    assert '[data-testid="stBaseButton-secondaryFormSubmit"]' in rule
+
+
 def test_theme_css_covers_every_element_family_the_design_calls_for():
     css = theme.THEME_CSS
     for hook in (
@@ -469,7 +494,7 @@ def test_page_header_signature_is_the_agreed_one():
     ]
 
 
-@pytest.mark.parametrize("page", ["jobs.py", "candidates.py", "interviews.py"])
+@pytest.mark.parametrize("page", ["jobs.py", "candidates_list.py", "users.py"])
 def test_the_hr_pages_open_with_page_header_not_a_bare_title(page):
     src = (_APP / "pages" / page).read_text(encoding="utf-8")
     assert "page_header(" in src

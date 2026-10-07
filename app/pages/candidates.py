@@ -85,7 +85,6 @@ from app.services.screening_question_service import (
 from app.services.screening_scoring import bucket_of
 from app.services.storage_service import list_documents_for_application
 from app.utils.authorization import UnauthorizedError
-from app.utils.session import get_current_user
 from app.utils.ui import (
     ai_provenance,
     badge,
@@ -99,12 +98,8 @@ from app.utils.ui import (
     truncate,
 )
 from app.utils.ui_widgets import (
-    HR_JOB_PICKER_KEY,
     detail_lines,
-    job_picker,
     load_error,
-    load_job_options,
-    page_header,
     success_toast,
 )
 
@@ -1013,10 +1008,10 @@ def _render_ranked_row(
     st.caption(row.candidate_email)
     if row.mandatory_unknown_flag:
         st.warning(
-            "⚠️ A mandatory requirement had no evidence either way for this "
+            "A mandatory requirement had no evidence either way for this "
             "candidate — the rank reflects only what could be assessed. Not a "
             "failure; worth confirming at interview.",
-            icon="⚠️",
+            icon=":material/warning:",
         )
     _render_buckets(row)
     _render_shortlist_control(
@@ -1325,48 +1320,3 @@ def _render_applications_tab(job_id: str, acting_user_id) -> None:
         ):
             st.session_state["candidates_apps_shown"] = shown + _APP_PAGE_SIZE
             st.rerun()
-
-
-def render_candidates_page() -> None:
-    current = get_current_user(st.session_state)
-    if current is None:  # defensive: gate is in main.py
-        st.error("Please sign in.")
-        return
-
-    try:
-        acting_user_id = uuid.UUID(current["id"])
-    except (ValueError, KeyError, TypeError):
-        # Session data is unusable — do not proceed with a None identity; the
-        # HR-only services would (correctly) reject it anyway.
-        st.error("Your session looks invalid — please sign out and back in.")
-        return
-
-    page_header("Candidates")
-
-    try:
-        jobs = load_job_options()
-    except SQLAlchemyError:
-        load_error("Couldn't load jobs right now.")
-        return
-
-    if not jobs:
-        st.caption("No jobs yet — create one on the Jobs page first.")
-        return
-
-    # One picker above the tabs, so both tabs always agree on which job they
-    # show. The shared key also carries the choice to the Interviews page
-    # (see ui_widgets.job_picker).
-    job_id = job_picker(jobs, key=HR_JOB_PICKER_KEY)
-    if job_id is None:
-        return
-
-    # H13: ranking and applications used to run down one unbounded page,
-    # rendering the same candidates twice. Two tabs, so each candidate appears
-    # once per view.
-    ranking_tab, applications_tab = st.tabs(
-        ["Ranking & Shortlist", "Applications"]
-    )
-    with ranking_tab:
-        _render_ranking_section(job_id, acting_user_id)
-    with applications_tab:
-        _render_applications_tab(job_id, acting_user_id)

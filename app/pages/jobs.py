@@ -61,7 +61,7 @@ from app.utils.overview_helpers import (
 )
 from app.utils.parsing import DocumentParsingError
 from app.utils.session import get_current_user
-from app.utils.ui import entity_status_badge, label_for
+from app.utils.ui import label_for
 from app.utils.ui_widgets import (
     confirmed,
     load_error,
@@ -345,8 +345,9 @@ def _render_approved_rubric(version_view: dict) -> None:
     approved_at = version_view["approved_at"]
     when = approved_at.strftime("%Y-%m-%d %H:%M") if approved_at else "—"
     st.success(
-        f"✅ Approved rubric — version {version_view['version_number']} "
-        f"(approved {when})"
+        f"Approved rubric — version {version_view['version_number']} "
+        f"(approved {when})",
+        icon=":material/check_circle:",
     )
     _render_criteria_readonly(version_view["criteria"])
 
@@ -556,8 +557,8 @@ def _render_link_section(job_id, job_status: str, requested_by_user_id) -> None:
     st.markdown("#### Application link")
 
     if job_status == JobStatus.CLOSED:
-        st.error("🔒 This job is **closed** — not accepting applications. (Reopening "
-                 "a closed job isn't supported yet.)")
+        st.error("This job is **closed** — not accepting applications. (Reopening "
+                 "a closed job isn't supported yet.)", icon=":material/lock:")
         return
 
     try:
@@ -632,60 +633,6 @@ def _render_link_section(job_id, job_status: str, requested_by_user_id) -> None:
                     job_id=job_id,
                     requested_by_user_id=requested_by_user_id,
                 )
-
-
-def _card_label(job_view: dict) -> str:
-    """The always-visible summary line on a collapsed card: title, department,
-    precise status badge, and the created date."""
-    department = job_view["department"] or "No department"
-    created = job_view["created_at"]
-    when = f" · created {created:%Y-%m-%d}" if created else ""
-    return (
-        f"**{job_view['title']}** — {department}  "
-        f"{entity_status_badge('job', job_view['status'])}{when}"
-    )
-
-
-def _render_job_card(
-    job_view: dict, requested_by_user_id, *, default_expanded: bool
-) -> None:
-    """One job as a collapsible card.
-
-    ``on_change="rerun"`` + the ``.open`` check make the body **lazy**: a
-    collapsed card runs none of the requirement / rubric / link queries below.
-    That is what actually bounds this page's cost, not the visual collapse.
-    """
-    job_id = job_view["id"]
-
-    # Increment 2: one click into the job's workspace. The title is a button too
-    # (a card header cannot hold one), so either opens it.
-    open_row = st.columns([5, 2], vertical_alignment="center")
-    open_row[0].button(
-        job_view["title"],
-        key=f"ws_title_{job_id}",
-        type="tertiary",
-        on_click=open_workspace,
-        args=(str(job_id),),
-    )
-    open_row[1].button(
-        "Open workspace",
-        key=f"ws_open_{job_id}",
-        type="primary",
-        on_click=open_workspace,
-        args=(str(job_id),),
-    )
-
-    card = st.expander(
-        _card_label(job_view),
-        expanded=default_expanded,
-        key=f"jobcard_{job_id}",
-        on_change="rerun",
-    )
-    if not card.open:
-        return
-
-    with card:
-        _render_job_body(job_view, requested_by_user_id)
 
 
 def _render_job_body(job_view: dict, requested_by_user_id) -> None:
