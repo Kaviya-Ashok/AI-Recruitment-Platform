@@ -25,13 +25,11 @@ from app.services.application_link_service import (
 from app.services.job_service import (
     JdAnalysisError,
     JobNotFoundError,
-    JobSort,
     JobValidationError,
     analyze_jd,
     count_jobs_by_status,
     create_job,
     get_current_requirements,
-    list_jobs,
 )
 from app.services.rubric_service import (
     RubricError,
@@ -46,6 +44,20 @@ from app.services.rubric_service import (
     get_current_draft,
     list_criteria,
     update_criterion,
+)
+from app.services.overview_service import list_jobs_overview
+from app.utils.authorization import UnauthorizedError
+from app.utils.overview_helpers import (
+    DEFAULT_PAGE_SIZE,
+    clamp_page,
+    has_next,
+    has_previous,
+    normalise_filter_text,
+    page_offset,
+    page_range_text,
+    selected_row_id,
+    stage_text,
+    table_key,
 )
 from app.utils.parsing import DocumentParsingError
 from app.utils.session import get_current_user
@@ -79,13 +91,7 @@ _LINK_STATUSES = {
     JobStatus.CLOSED,
 }
 
-# --- Jobs list: tabs, search/sort, paging ---------------------------------
-
-#: Jobs loaded per "Show more" click (and on first paint) in each tab.
-_PAGE_SIZE = 10
-
-#: A tab showing more than this many cards defaults them all to collapsed.
-_EXPAND_THRESHOLD = 5
+# --- Jobs list: status groups ----------------------------------------------
 
 # Three HR-facing tabs over the SEVEN JobStatus values. These are display
 # *groups*, not new statuses: nothing here changes what a status means or how a
@@ -120,14 +126,6 @@ _TABS: tuple[tuple[str, str, frozenset[str]], ...] = tuple(
     (key, label_status, statuses | _UNGROUPED if key == "draft" else statuses)
     for key, label_status, statuses in _TAB_GROUPS
 )
-
-#: Human sort label -> JobSort value. Order here is the selectbox order.
-_SORT_OPTIONS: dict[str, str] = {
-    "Newest": JobSort.NEWEST,
-    "Oldest": JobSort.OLDEST,
-    "Recently updated": JobSort.RECENTLY_UPDATED,
-}
-
 
 def _public_apply_url(token: str) -> str:
     # Streamlit (1.62) has no URL path params, so the public candidate app
@@ -731,92 +729,54 @@ def _job_view(job) -> dict:
     }
 
 
-def _shown_count(tab_key: str, search: str, sort_value: str) -> int:
-    """How many cards this tab currently shows, held in session state so a
-    "Show more" click survives the rerun.
+_STATUS_KEY = "jobs_status"
+_PAGE_KEY = "jobs_page"
+_SIGNATURE_KEY = "jobs_filters"
+_ALL = "all"
 
-    The count resets to one page whenever the tab's search text or sort order
-    changes — otherwise a large offset carried over from a previous query would
-    silently skip the first results of the new one.
-    """
-    count_key = f"jobs_shown_{tab_key}"
-    query_key = f"jobs_query_{tab_key}"
-    query = (search.strip().lower(), sort_value)
-
-    if st.session_state.get(query_key) != query:
-        st.session_state[query_key] = query
-        st.session_state[count_key] = _PAGE_SIZE
-
-    return int(st.session_state.get(count_key, _PAGE_SIZE))
+_INACTIVE = "Your account is no longer active — please contact an admin."
 
 
-def _render_tab(
-    tab_key: str, label_status: str, statuses: frozenset[str], requested_by_user_id
-) -> None:
-    controls = st.columns([3, 2])
-    search = controls[0].text_input(
-        "Search",
-        key=f"jobs_search_{tab_key}",
-        placeholder="Search title or department…",
-        label_visibility="collapsed",
-    )
-    sort_label = controls[1].selectbox(
-        "Sort",
-        list(_SORT_OPTIONS),
-        key=f"jobs_sort_{tab_key}",
-        label_visibility="collapsed",
-        help="Sort order for this tab.",
-    )
-    sort_value = _SORT_OPTIONS[sort_label]
-
-    shown = _shown_count(tab_key, search, sort_value)
-
-    try:
-        with session_scope() as db:
-            # One extra row tells us whether a "Show more" is warranted without
-            # a second COUNT query.
-            page = list_jobs(
-                db,
-                statuses=statuses,
-                search=search,
-                sort=sort_value,
-                limit=shown + 1,
-            )
-            job_views = [_job_view(j) for j in page]
-    except SQLAlchemyError:
-        load_error("Couldn't load the job list right now.")
-        return
-
-    has_more = len(job_views) > shown
-    job_views = job_views[:shown]
-
-    if not job_views:
-        if search.strip():
-            st.caption("No jobs match your search.")
-        else:
-            st.caption(f"No {label_for(label_status).lower()} jobs.")
-        return
-
-    # The collapse default is evaluated on what is ACTUALLY rendered right now
-    # (after search and paging), not on the tab's total. If a search narrows 40
-    # jobs to 2, those 2 open — the user has already said what they want; making
-    # them click twice more would defeat the search.
-    default_expanded = len(job_views) <= _EXPAND_THRESHOLD
-
-    for job_view in job_views:
-        _render_job_card(
-            job_view, requested_by_user_id, default_expanded=default_expanded
+def _status_choices(counts: dict[str, int]) -> dict[str, str]:
+    """Status control key -> label: "All" then one entry per status GROUP (``_TABS``),
+    each with how many jobs it holds. The counts are the whole pipeline, never
+    narrowed by the text filter, so the control stays a stable overview. Pure."""
+    labels = {_ALL: f"All ({sum(counts.values())})"}
+    for key, label_status, statuses in _TABS:
+        labels[key] = (
+            f"{label_for(label_status)} ({sum(counts.get(s, 0) for s in statuses)})"
         )
+    return labels
 
-    if has_more:
-        if st.button(
-            f"Show more ({_PAGE_SIZE} at a time)", key=f"jobs_more_{tab_key}"
-        ):
-            st.session_state[f"jobs_shown_{tab_key}"] = shown + _PAGE_SIZE
-            st.rerun()
+
+def _statuses_for(choice: str) -> frozenset[str] | None:
+    """The statuses behind a status-control key (``None`` for "All")."""
+    for key, _label, statuses in _TABS:
+        if key == choice:
+            return statuses
+    return None
+
+
+def _set_jobs_page(page: int) -> None:
+    st.session_state[_PAGE_KEY] = page
+
+
+def _current_jobs_page(signature: tuple) -> int:
+    """The page index, returned to 0 whenever the filters changed since last run."""
+    if st.session_state.get(_SIGNATURE_KEY) != signature:
+        st.session_state[_SIGNATURE_KEY] = signature
+        st.session_state[_PAGE_KEY] = 0
+    page = st.session_state.get(_PAGE_KEY, 0)
+    return page if isinstance(page, int) else 0
 
 
 def _render_job_list(requested_by_user_id) -> None:
+    """The jobs table: job (code and title), status, current stage, applicants,
+    interviewed, decided — with a text filter, a status control built from the status
+    groups, paging, and row selection that opens the job's workspace.
+
+    One counts statement plus the page and its total (``list_jobs_overview``) — never
+    a query per job. The create-job form above is untouched."""
     st.subheader("Jobs")
 
     try:
@@ -826,16 +786,87 @@ def _render_job_list(requested_by_user_id) -> None:
         load_error("Couldn't load the job list right now.")
         return
 
-    # Counts are the whole pipeline per tab — deliberately NOT narrowed by the
-    # search box, so the tab bar stays a stable overview while typing.
-    labels = [
-        f"{label_for(label_status)} ({sum(counts.get(s, 0) for s in statuses)})"
-        for _, label_status, statuses in _TABS
-    ]
+    choices = _status_choices(counts)
+    bar = st.columns([3, 5], vertical_alignment="center")
+    search = normalise_filter_text(
+        bar[0].text_input(
+            "Filter", key="jobs_filter", placeholder="Filter jobs",
+            label_visibility="collapsed",
+        )
+    )
+    choice = bar[1].segmented_control(
+        "Status", list(choices), format_func=choices.__getitem__,
+        selection_mode="single", default=_ALL, required=True, key=_STATUS_KEY,
+        label_visibility="collapsed",
+    )
+    choice = choice if choice in choices else _ALL
 
-    for tab, (tab_key, label_status, statuses) in zip(st.tabs(labels), _TABS):
-        with tab:
-            _render_tab(tab_key, label_status, statuses, requested_by_user_id)
+    page = _current_jobs_page((search, choice))
+    statuses = _statuses_for(choice)
+    try:
+        with session_scope() as db:
+            data = list_jobs_overview(
+                db, acting_user_id=requested_by_user_id, statuses=statuses,
+                search=search, limit=DEFAULT_PAGE_SIZE, offset=page_offset(page),
+            )
+            clamped = clamp_page(page, data.total)
+            if clamped != page:
+                page = clamped
+                data = list_jobs_overview(
+                    db, acting_user_id=requested_by_user_id, statuses=statuses,
+                    search=search, limit=DEFAULT_PAGE_SIZE, offset=page_offset(page),
+                )
+    except UnauthorizedError:
+        st.error(_INACTIVE)
+        return
+    except SQLAlchemyError:
+        load_error("Couldn't load the job list right now.")
+        return
+    st.session_state[_PAGE_KEY] = page
+
+    if data.total == 0:
+        st.caption(
+            "No jobs match these filters." if (search or choice != _ALL)
+            else "No jobs yet — create one above."
+        )
+        return
+
+    rows = list(data.rows)
+    event = st.dataframe(
+        [
+            {
+                "Job": f"{r.job_code} {r.title}",
+                "Status": label_for(r.status),
+                "Current stage": stage_text(r.stage_key),
+                "Applicants": r.applicants,
+                "Interviewed": r.interviewed,
+                "Decided": r.decided,
+            }
+            for r in rows
+        ],
+        hide_index=True,
+        width="stretch",
+        height="content",
+        on_select="rerun",
+        selection_mode="single-row",
+        key=table_key("jobs_table", search, choice, page),
+    )
+    pager = st.columns([1, 1, 6], vertical_alignment="center")
+    pager[0].button(
+        "Previous", key="jobs_prev", disabled=not has_previous(page),
+        on_click=_set_jobs_page, args=(page - 1,),
+    )
+    pager[1].button(
+        "Next", key="jobs_next", disabled=not has_next(data.total, page),
+        on_click=_set_jobs_page, args=(page + 1,),
+    )
+    pager[2].caption(page_range_text(data.total, page))
+    st.caption("Select a row to open the job's workspace.")
+
+    chosen = selected_row_id(event.selection.rows, [r.job_id for r in rows])
+    if chosen is not None:
+        open_workspace(chosen)
+        st.rerun()
 
 
 def render_jobs_page() -> None:

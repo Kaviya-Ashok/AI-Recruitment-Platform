@@ -477,7 +477,10 @@ def test_the_hr_pages_open_with_page_header_not_a_bare_title(page):
 
 
 def test_the_dashboard_opens_with_page_header():
-    src = (_APP / "main.py").read_text(encoding="utf-8")
-    assert 'page_header(\n        "Dashboard"' in src
+    # the Dashboard moved to app/pages/dashboard.py in HR UI Increment 4
+    src = (_APP / "pages" / "dashboard.py").read_text(encoding="utf-8")
+    assert 'page_header("Dashboard"' in src
+    main_src = (_APP / "main.py").read_text(encoding="utf-8")
+    assert "render_dashboard_page(_PAGES)" in main_src
     # the login screen keeps its own plain title
-    assert 'st.title("Recruitment Intelligence Platform")' in src
+    assert 'st.title("Recruitment Intelligence Platform")' in main_src

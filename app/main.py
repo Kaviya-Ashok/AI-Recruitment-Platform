@@ -30,24 +30,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-import uuid
-
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.database.database import session_scope
-from app.database.models.application import ApplicationStatus
-from app.database.models.job import JobStatus
 from app.database.models.user import UserRole
-from app.pages.candidates import render_candidates_page
+from app.pages.candidates_list import render_candidates_list_page
+from app.pages.dashboard import render_dashboard_page
 from app.pages.interviews import render_interviews_page
 from app.pages.jobs import render_jobs_page
 from app.pages.users import render_users_page
-from app.services.application_service import list_applications_for_job
 from app.services.auth_service import authenticate_user
-from app.services.job_service import list_jobs
-from app.services.shortlist_service import get_shortlist_status_for_job
-from app.utils.authorization import UnauthorizedError
 from app.utils.session import (
     clear_current_user,
     get_current_user,
@@ -56,8 +49,6 @@ from app.utils.session import (
 )
 from app.ui.theme import inject_theme
 from app.utils.ui import label_for
-from app.utils.ui_widgets import page_header
-from app.utils.workspace_nav import deep_link_target
 
 st.set_page_config(
     page_title="Recruitment Intelligence Platform",
@@ -111,136 +102,12 @@ def _login_page() -> None:
     st.rerun()
 
 
-def _acting_user_id() -> uuid.UUID | None:
-    current = get_current_user(st.session_state)
-    try:
-        return uuid.UUID(current["id"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-
-def _gather_landing_data(acting_user_id: uuid.UUID) -> dict:
-    """Aggregate the dashboard counts by walking existing per-job accessors.
-
-    No new service code: ``list_jobs`` + ``list_applications_for_job`` +
-    ``get_shortlist_status_for_job`` across every job. This is read-only and
-    already behind the HR login.
-
-    "Candidates awaiting review" = applications at
-    ``SCREENING_EVALUATED`` (their initial scorecard exists) that are **not
-    currently shortlisted** — i.e. HR has not yet acted on them. An explicitly
-    unshortlisted candidate counts as already reviewed.
-    """
-    open_jobs = 0
-    awaiting_review = 0
-    shortlisted = 0
-    attention: list[dict] = []
-
-    with session_scope() as db:
-        jobs = list_jobs(db)
-        for job in jobs:
-            if job.status == JobStatus.OPEN:
-                open_jobs += 1
-
-            shortlist = get_shortlist_status_for_job(
-                db, job_id=job.id, acting_user_id=acting_user_id
-            )
-            job_awaiting = 0
-            for application in list_applications_for_job(db, job.id):
-                entry = shortlist.get(application.id)
-                is_shortlisted = bool(entry and entry.is_shortlisted)
-                if is_shortlisted:
-                    shortlisted += 1
-                if (
-                    application.status == ApplicationStatus.SCREENING_EVALUATED
-                    and not is_shortlisted
-                ):
-                    job_awaiting += 1
-
-            awaiting_review += job_awaiting
-            if job_awaiting:
-                attention.append(
-                    {
-                        "title": job.title,
-                        "page": "candidates",
-                        "note": (
-                            f"{job_awaiting} candidate"
-                            f"{'s' if job_awaiting != 1 else ''} awaiting review"
-                        ),
-                    }
-                )
-            elif job.status in (JobStatus.JD_ANALYZED, JobStatus.RUBRIC_PENDING):
-                attention.append(
-                    {
-                        "title": job.title,
-                        "page": "jobs",
-                        "note": "rubric awaiting approval",
-                    }
-                )
-
-    return {
-        "has_jobs": bool(jobs),
-        "open_jobs": open_jobs,
-        "awaiting_review": awaiting_review,
-        "shortlisted": shortlisted,
-        "attention": attention,
-    }
-
-
 def _dashboard_page() -> None:
-    # A workspace link (``/?job=..&stage=..``) lands here after sign-in or a
-    # refresh, because the logged-out redirect drops the Jobs page's path. Hand it
-    # on to the Jobs page, which shows the workspace. This runs ONLY on the
-    # Dashboard — the Jobs page never redirects — and ``switch_page`` replaces the
-    # query string, so the parameters are consumed and cannot loop. A malformed
-    # ``job`` is ignored and the Dashboard renders normally. Nothing is logged.
-    # (Back/Forward limitation: see app/utils/workspace_nav.py.)
-    target = deep_link_target()
-    if target is not None:
-        st.switch_page(_PAGES["jobs"], query_params=target)
+    render_dashboard_page(_PAGES)
 
-    current = get_current_user(st.session_state)
-    page_header(
-        "Dashboard",
-        f"Signed in as {current['full_name']} · {label_for(current['role'])}",
-    )
 
-    acting_user_id = _acting_user_id()
-    if acting_user_id is None:
-        st.error("Your session looks invalid — please sign out and back in.")
-        return
-
-    try:
-        data = _gather_landing_data(acting_user_id)
-    except UnauthorizedError:
-        st.error("Your account is no longer active — please contact an admin.")
-        return
-    except SQLAlchemyError:
-        st.error("Couldn't load the dashboard right now. Please try again.")
-        return
-
-    if not data["has_jobs"]:
-        st.info("No jobs yet. Create your first job on the **Jobs** page.")
-        st.page_link(_PAGES["jobs"], label="Go to Jobs", icon=":material/work:")
-        return
-
-    cols = st.columns(3)
-    cols[0].metric("Open jobs", data["open_jobs"])
-    cols[1].metric("Candidates awaiting review", data["awaiting_review"])
-    cols[2].metric("Shortlisted", data["shortlisted"])
-
-    st.divider()
-    st.subheader("Needs your attention")
-    if not data["attention"]:
-        st.caption("Nothing waiting right now.")
-    else:
-        for item in data["attention"]:
-            row = st.columns([4, 2])
-            row[0].markdown(f"**{item['title']}** — {item['note']}")
-            row[1].page_link(
-                _PAGES[item["page"]],
-                label=f"Open {_PAGES[item['page']].title}",
-            )
+def _candidates_page() -> None:
+    render_candidates_list_page(_PAGES)
 
 
 def _render_account_sidebar() -> None:
@@ -262,7 +129,7 @@ _PAGES: dict[str, st.Page] = {
         render_jobs_page, title="Jobs", icon=":material/work:", url_path="jobs"
     ),
     "candidates": st.Page(
-        render_candidates_page,
+        _candidates_page,
         title="Candidates",
         icon=":material/group:",
         url_path="candidates",

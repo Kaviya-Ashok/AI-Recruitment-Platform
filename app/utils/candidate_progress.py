@@ -23,6 +23,24 @@ CANDIDATE_TABS: tuple[str, ...] = (
 )
 DEFAULT_TAB = "overview"
 
+#: Stage key -> the short word shown for it: the candidate page's header pill and the
+#: Candidates list's Stage column. ONE source for the wording; the SQL stage rule used
+#: by the lists (``overview_service``) is checked against :func:`stage_name` by a test.
+STAGE_LABELS: dict[str, str] = {
+    "applied": "Applied",
+    "screened": "Screened",
+    "shortlisted": "Shortlisted",
+    "interviewed": "Interviewed",
+    "ranked": "Ranked",
+    "decided": "Decided",
+}
+
+#: Furthest-stage-wins order used by :func:`stage_name`: the first stage in this
+#: sequence that is DONE names the candidate's stage; otherwise "applied".
+STAGE_PRECEDENCE: tuple[str, ...] = (
+    "decided", "ranked", "interviewed", "shortlisted", "screened",
+)
+
 #: Tab key -> label, in tab order.
 TAB_LABELS: dict[str, str] = {
     "overview": "Overview",
@@ -135,21 +153,22 @@ def progress_items(header: Any) -> tuple[ProgressItem, ...]:
     screened = bool(getattr(header, "screened", False))
     screening_score = getattr(header, "screening_score", None)
     return (
-        ProgressItem("applied", "Applied", True, "", "overview"),
+        ProgressItem("applied", STAGE_LABELS["applied"], True, "", "overview"),
         ProgressItem(
-            "screened", "Screened", screened,
+            "screened", STAGE_LABELS["screened"], screened,
             f"{float(screening_score):.2f}" if screening_score is not None
             else ("" if screened else "not screened yet"),
             "screening",
         ),
         ProgressItem(
-            "shortlisted", "Shortlisted",
+            "shortlisted", STAGE_LABELS["shortlisted"],
             bool(getattr(header, "is_shortlisted", False)),
             "" if getattr(header, "is_shortlisted", False) else "not shortlisted",
             "overview",
         ),
         ProgressItem(
-            "interviewed", "Interviewed", rated, interviewed_status, "interview",
+            "interviewed", STAGE_LABELS["interviewed"], rated, interviewed_status,
+            "interview",
             warn=unrated,
         ),
         ProgressItem(
@@ -158,9 +177,11 @@ def progress_items(header: Any) -> tuple[ProgressItem, ...]:
             "" if getattr(header, "has_analysis", False) else "not generated",
             "analysis",
         ),
-        ProgressItem("ranked", "Ranked", ranked, ranked_status, "scorecard"),
         ProgressItem(
-            "decided", "Decided", decision is not None,
+            "ranked", STAGE_LABELS["ranked"], ranked, ranked_status, "scorecard"
+        ),
+        ProgressItem(
+            "decided", STAGE_LABELS["decided"], decision is not None,
             label_for(decision) if decision is not None else "", "decision",
         ),
     )
@@ -171,10 +192,10 @@ def stage_name(header: Any) -> str:
     header's pill: Decided, Ranked, Interviewed, Shortlisted, Screened, else
     Applied. Pure."""
     by_key = {item.key: item for item in progress_items(header)}
-    for key in ("decided", "ranked", "interviewed", "shortlisted", "screened"):
+    for key in STAGE_PRECEDENCE:
         if by_key[key].done:
-            return by_key[key].label
-    return by_key["applied"].label
+            return STAGE_LABELS[key]
+    return STAGE_LABELS["applied"]
 
 
 def progress_button_label(item: ProgressItem) -> str:

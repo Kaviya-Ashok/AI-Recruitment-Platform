@@ -203,3 +203,21 @@ def detail_lines(pairs: Iterable[tuple[str, object]]) -> None:
     items = [f"- *{label}:* {value}" for label, value in pairs if value]
     if items:
         st.markdown("\n".join(items))
+
+
+# ---------------------------------------------------------------------------
+# Opening a job / candidate from another page
+# ---------------------------------------------------------------------------
+
+
+def go_to_jobs(pages, params: dict[str, str]) -> None:
+    """Open the Jobs page — which renders the job workspace or the candidate page
+    when the URL carries ``job`` / ``candidate`` — with ``params`` as its query
+    string (the existing deep-link scheme; see ``app/utils/workspace_nav.py``).
+
+    Call it from the body of a script run after a button or a table selection (not
+    from a callback). ``st.switch_page`` replaces the query string, so the
+    parameters are consumed once and cannot loop. ``pages`` is the registry of
+    ``st.Page`` objects ``app/main.py`` passes in.
+    """
+    st.switch_page(pages["jobs"], query_params=params)
